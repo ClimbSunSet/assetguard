@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>UE 검증 스크립트 테스트</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; background: #fff; color: #111; }
+  .pass { color: #0a7d32; } .fail { color: #c62828; font-weight: 600; }
+  pre { background: #f4f4f4; padding: 8px; white-space: pre-wrap; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>ue/spike_datatable.py 로직 테스트 (가짜 unreal 모듈)</h1>
+<p>언리얼 없이 브라우저(Pyodide)에서 스크립트를 실행합니다. 언리얼 API 자체는 흉내일 뿐이라, 실제 엔진 동작은 검증하지 않습니다.</p>
+<p id="summary">Pyodide 불러오는 중…</p>
+<ul id="out"></ul>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const HARNESS = String.raw`
+import sys, types, json, os, runpy, subprocess, io
+
+SCRIPT = '/spike_datatable.py'
+MAGIC = bytes([0xC1, 0x83, 0x2A, 0x9E])
+ROWS = [
+    {"Name": "Goblin", "HP": 100, "Speed": 3.5, "Alive": True, "Mesh": "/Game/M/SK_Goblin.SK_Goblin", "Tags": ["a", "b"], "Stats": {"Str": 1}},
+    {"Name": "Orc", "HP": 250, "Speed": 2.0, "Alive": False, "Mesh": "/Game/M/SK_Orc.SK_Orc", "Tags": [], "Stats": {"Str": 5}},
+]
+
+def build_unreal(lossy=False, pointer=True, magic_ok=True, workfile_matches=True, rev_rows=None):
+    u = types.ModuleType('unreal')
+    u.logs = []
+    u.log = lambda m: u.logs.append(m)
+    u.log_warning = lambda m: u.logs.append('W:' + m)
+
+    class Struct:
+        def __init__(s, n): s.n = n
+        def get_name(s): return s.n
+    class UserDefinedStruct(Struct): pass
+    class Cls:
+        def __init__(s, n): s.n = n
+        def get_name(s): return s.n
+    class DataTable:
+        def __init__(s, path, rows, struct=None):
+            s.path, s.rows, s.struct = path, rows, struct or Struct('FMonsterRow')
+        def get_editor_property(s, k):
+            assert k == 'row_struct'; return s.struct
+        def get_class(s): return Cls('DataTable')
+    u.Struct, u.UserDefinedStruct, u.DataTable = Struct, UserDefinedStruct, DataTable
+
+    store = {'/Game/Data/DT_Monsters': DataTable('/Game/Data/DT_Monsters', json.loads(json.dumps(ROWS)), UserDefinedStruct('S_Monster'))}
+    u.store = store
+
+    def _load_asset(p):
+        if p.startswith('/Game/__AssetGuard_Spike/rev/'):
+            f = '/proj/Content/' + p[len('/Game/'):] + '.uasset'
+            data = open(f, 'rb').read()
+            assert data[:4] == MAGIC
+            return DataTable(p, json.loads(data[4:].decode()))
+        return store.get(p)
+
+    class AD:
+        asset_class_path = types.SimpleNamespace(asset_name='DataTable')
+    class EAL:
+        list_assets = staticmethod(lambda d, recursive=True, include_folder=False: [k + '.' + k.rsplit('/', 1)[1] for k in store])
+        find_asset_data = staticmethod(lambda p: AD())
+        load_asset = staticmethod(_load_asset)
+        does_asset_exist = staticmethod(lambda p: p in store)
+        delete_asset = staticmethod(lambda p: store.pop(p, None))
+        save_asset = staticmethod(lambda p, only_if_is_dirty=True: True)
+        @staticmethod
+        def duplicate_asset(s, d):
+            store[d] = DataTable(d, json.loads(json.dumps(store[s].rows)))
+            return store[d]
+        @staticmethod
+        def delete_directory(p):
+            for k in [k for k in store if k.startswith(p)]: store.pop(k)
+            u.deleted_dir = p
+    u.EditorAssetLibrary = EAL
+
+    def fill(t, s):
+        rows = json.loads(s)
+        if lossy:
+            for r in rows: r.pop('Tags', None)   # simulate a property that does not survive import
+        t.rows = rows
+        return True
+    class DTL:
+        export_data_table_to_json_string = staticmethod(lambda t: json.dumps(t.rows))
+        fill_data_table_from_json_string = staticmethod(fill)
+    u.DataTableFunctionLibrary = DTL
+
+    class Paths:
+        project_dir = staticmethod(lambda: '/proj/')
+        project_content_dir = staticmethod(lambda: '/proj/Content/')
+        project_saved_dir = staticmethod(lambda: '/proj/Saved/')
+        convert_relative_path_to_full = staticmethod(lambda p: p)
+    u.Paths = Paths
+    class Reg:
+        def scan_paths_synchronous(s, paths, force=False): u.scanned = paths
+    u.AssetRegistryHelpers = types.SimpleNamespace(get_asset_registry=lambda: Reg())
+    u.SystemLibrary = types.SimpleNamespace(get_engine_version=lambda: '5.8.0-test')
+
+    blob = (MAGIC if magic_ok else b'XXXX') + json.dumps(rev_rows if rev_rows is not None else ROWS).encode()
+    pointer_bytes = b'version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 10\n'
+    u.git_calls = []
+    def fake_run(cmd, cwd=None, input=None, stdout=None, stderr=None, creationflags=0):
+        u.git_calls.append(cmd)
+        out, code = b'', 0
+        if cmd[1:3] == ['rev-parse', '--show-toplevel']: out = b'/proj\n'
+        elif cmd[1:3] == ['lfs', 'version']: out = b'git-lfs/3'
+        elif cmd[1] == 'check-attr': out = (cmd[-1] + ': filter: lfs\n').encode()
+        elif cmd[1] == 'show':
+            assert cmd[2] == 'HEAD:Content/Data/DT_Monsters.uasset', cmd
+            out = pointer_bytes if pointer else blob
+        elif cmd[1:3] == ['lfs', 'smudge']:
+            assert input == pointer_bytes; out = blob
+        elif cmd[1] == 'diff': code = 0 if workfile_matches else 1
+        return types.SimpleNamespace(returncode=code, stdout=out, stderr=b'')
+    subprocess.run = fake_run
+    return u
+
+def run_script(argv, **kw):
+    u = build_unreal(**kw)
+    sys.modules['unreal'] = u
+    sys.argv = [SCRIPT] + argv
+    for d in ['/proj/Content/Data', '/proj/Saved']: os.makedirs(d, exist_ok=True)
+    runpy.run_path(SCRIPT, run_name='__main__')
+    rep = json.load(open('/proj/Saved/AssetGuard/spike_report.json', encoding='utf-8'))
+    return u, rep
+
+results = []
+def test(name, fn):
+    try:
+        fn(); results.append([name, True, ''])
+    except Exception as e:
+        import traceback; results.append([name, False, traceback.format_exc()])
+
+def t_all_pass():
+    u, rep = run_script([])
+    t = rep['tables'][0]
+    assert t['asset'] == '/Game/Data/DT_Monsters', t
+    assert t['roundtrip']['ok'], t['roundtrip']
+    assert t['revision']['ok'], t['revision']
+    assert t['revision']['lfs_attr'] is True and t['revision']['lfs_pointer'] is True
+    assert t['original_untouched'] is True
+    assert t['row_struct']['kind'].startswith('블루프린트'), t['row_struct']
+    assert {'숫자', 'bool', '배열', '구조체/맵', '에셋 경로'} <= set(t['value_kinds']), t['value_kinds']
+    assert u.deleted_dir == '/Game/__AssetGuard_Spike'
+    assert not [k for k in u.store if k.startswith('/Game/__AssetGuard_Spike')]
+    assert any('전체 결과' in l for l in u.logs)
+
+def t_lossy():
+    u, rep = run_script(['/Game/Data/DT_Monsters'], lossy=True)
+    rt = rep['tables'][0]['roundtrip']
+    assert rt['ok'] is False and 'Tags' in rt['detail'], rt
+
+def t_bad_magic():
+    u, rep = run_script([], magic_ok=False)
+    rv = rep['tables'][0]['revision']
+    assert rv['ok'] is False and '.uasset' in rv['detail'], rv
+
+def t_revision_differs():
+    other = [dict(r, HP=r['HP'] + 1) for r in ROWS]
+    u, rep = run_script([], rev_rows=other)
+    rv = rep['tables'][0]['revision']
+    assert rv['ok'] is False and 'HP' in rv['detail'], rv   # same rev as workfile but content differs -> must fail
+
+def t_other_version():
+    u, rep = run_script(['--rev=HEAD'], workfile_matches=False, pointer=False)
+    rv = rep['tables'][0]['revision']
+    assert rv['ok'] is True and rv['lfs_pointer'] is False and '생략' in rv['detail'], rv
+
+def t_commandlet_args():
+    u, rep = run_script(['/Game/Data/DT_Monsters --keep'])
+    assert rep['tables'][0]['asset'] == '/Game/Data/DT_Monsters'
+    assert not hasattr(u, 'deleted_dir')   # --keep leaves the temp folder
+
+test('정상: 왕복·과거 버전(LFS 포인터 풀기)·원본 무변경·임시 폴더 정리', t_all_pass)
+test('가져오기에서 값이 빠지면 왕복 실패로 보고', t_lossy)
+test('.uasset 형식이 아닌 파일은 실패로 보고', t_bad_magic)
+test('같은 버전인데 내용이 다르면 실패로 보고', t_revision_differs)
+test('작업 파일과 다른 버전이면 비교 생략, LFS 아닌 저장소', t_other_version)
+test('커맨드릿처럼 인수가 한 문자열로 와도 처리 (--keep)', t_commandlet_args)
+json.dumps(results)
+`;
+
+(async () => {
+  const out = document.getElementById('out'), summary = document.getElementById('summary');
+  try {
+    const py = await loadPyodide();
+    const src = await (await fetch('/ue/spike_datatable.py', { cache: 'no-store' })).text();
+    py.FS.writeFile('/spike_datatable.py', src);
+    py.runPython("compile(open('/spike_datatable.py', encoding='utf-8').read(), 'spike_datatable.py', 'exec')");
+    const results = JSON.parse(py.runPython(HARNESS));
+    const failed = results.filter(r => !r[1]);
+    summary.innerHTML = failed.length ? `<span class="fail">${failed.length}개 실패</span> / ${results.length}개` : `<span class="pass">모두 통과</span> (${results.length}개)`;
+    out.innerHTML = results.map(r => `<li class="${r[1] ? 'pass' : 'fail'}">${r[1] ? '✔' : '✘'} ${r[0]}${r[1] ? '' : '<pre>' + r[2].replace(/</g, '&lt;') + '</pre>'}</li>`).join('');
+    window.__testResults = { total: results.length, failed: failed.map(f => f[0] + ': ' + f[2]) };
+  } catch (e) {
+    summary.innerHTML = '<span class="fail">실행 오류</span><pre>' + String(e).replace(/</g, '&lt;') + '</pre>';
+    window.__testResults = { total: 0, failed: [String(e)] };
+  }
+})();
+</script>
+</body>
+</html>

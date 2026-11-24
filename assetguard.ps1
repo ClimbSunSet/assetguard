@@ -240,7 +240,7 @@ function Serve-Static($res, [string]$urlPath) {
   if ($urlPath -eq '/') { $urlPath = '/web/index.html' }
   $rel = [Uri]::UnescapeDataString($urlPath.TrimStart('/')) -replace '/', '\'
   $full = [IO.Path]::GetFullPath((Join-Path $ToolRoot $rel))
-  $allowed = @((Join-Path $ToolRoot 'web'), (Join-Path $ToolRoot 'tests')) | ForEach-Object { [IO.Path]::GetFullPath($_) + '\' }
+  $allowed = @((Join-Path $ToolRoot 'web'), (Join-Path $ToolRoot 'tests'), (Join-Path $ToolRoot 'ue')) | ForEach-Object { [IO.Path]::GetFullPath($_) + '\' }
   $ok = $false
   foreach ($a in $allowed) { if ($full.StartsWith($a, [StringComparison]::OrdinalIgnoreCase)) { $ok = $true } }
   if (-not $ok -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
