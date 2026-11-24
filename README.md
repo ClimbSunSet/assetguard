@@ -106,7 +106,9 @@ git commit                 # 머지 마무리
 `.uasset`을 다루려면 언리얼 에디터와 연결해야 합니다. 계획은 이렇습니다.
 Git의 세 버전 `.uasset`을 임시 에셋으로 불러와 에디터 Python의 `DataTableFunctionLibrary`로 JSON을 뽑고,
 이 도구의 병합 엔진(`web/merge.js`)으로 합친 뒤, 결과 JSON을 다시 DataTable에 채워 저장합니다.
-사업계획서에 "[기술 검증 필요]"로 적힌 "임시 버전 에셋 불러오기" 단계가 여기에 해당하고, 아직 검증하지 않았습니다.
+사업계획서에 "[기술 검증 필요]"로 적힌 "임시 버전 에셋 불러오기" 단계가 여기에 해당합니다.
+이 단계를 확인하는 검증 스크립트가 [`ue/`](ue/README.md)에 있습니다.
+UE 5.8.4 검증용 프로젝트에서는 JSON 왕복, Git LFS에서 꺼낸 과거 버전 불러오기, 원본 무변경 검사가 모두 통과했습니다.
 
 ## 구조
 
@@ -118,6 +120,8 @@ web/merge.js            3-way 병합 엔진 (UI·Git과 분리된 순수 함수)
 web/formats.js          DataTable JSON/CSV 읽기·쓰기 (원래 스타일 유지)
 web/index.html, app.js  병합 화면: 출처 색 표시, 확인할 곳만 모아 보기, 충돌 선택
 tests/merge.test.html   병합 엔진·포맷 테스트 37개
+tests/ue_spike.test.html  UE 검증 스크립트 로직 테스트 6개 (Pyodide, 가짜 unreal 모듈)
+ue/spike_datatable.py   UE 연동 기술 검증 스크립트 (에디터 Python)
 demo/make-demo-repo.ps1 충돌 재현용 데모 저장소 생성
 ```
 
