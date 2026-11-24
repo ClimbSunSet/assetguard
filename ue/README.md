@@ -114,6 +114,21 @@ powershell -ExecutionPolicy Bypass -File ue\make-spike-project.ps1 -Engine E:\UE
 - 테스트 DataTable을 v1, v2 두 번 커밋한 뒤 검증 스크립트를 `HEAD`, `HEAD~1`로 한 번씩 실행합니다.
 - 프로젝트는 그대로 두고 검증만 다시 돌리려면 `-SkipCreate`를 붙이세요.
 
+## 2단계: AssetGuard에 연결 (실제 `.uasset` 충돌 해결)
+
+검증한 방식을 `assetguard_bridge.py`로 옮겨서 `assetguard.ps1`에 연결했습니다. 사용법은 상위 [README](../README.md#uasset-datatable-병합)에 있습니다.
+
+`make-uasset-conflict.ps1`로 검증용 프로젝트에 실제 머지 충돌을 만들어 끝까지 해결해 봤습니다 (UE 5.8.4, LFS).
+
+| 파일 | 결과 |
+|---|---|
+| `DT_BPStruct.uasset` (블루프린트 구조체) | 모두 자동 병합 (Row_A는 나, Row_C는 상대). 저장 후 git add |
+| `DT_Tags.uasset` (C++ 구조체) | 자동 병합 6칸 (Fire·Earth는 나, Ice·Thunder는 상대). Wind 설명 1곳만 직접 입력. 저장 후 git add |
+
+- 걸린 시간: 세 버전 읽기 11초, 파일당 저장 11초.
+- 머지 커밋 후 **새 언리얼 프로세스로 디스크의 에셋을 다시 읽어서**, 의도한 결과(한글 직접 입력 포함)와 정확히 같은 것을 확인했습니다.
+- 에셋은 LFS로 정상 저장됐고, 임시 폴더(`Content/__AssetGuard`, `%TEMP%\assetguard-*`)도 남지 않았습니다.
+
 ## 이 스크립트가 확인하지 못하는 것
 
 - JSON에 아예 나오지 않는 속성(Transient 등)은 1번 비교 대상이 아닙니다.

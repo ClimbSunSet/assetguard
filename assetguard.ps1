@@ -1,6 +1,7 @@
 ﻿<#
 .SYNOPSIS
-  AssetGuard MVP - Git 머지 충돌이 난 DataTable(JSON/CSV)을 칸 단위로 합치는 로컬 도구.
+  AssetGuard MVP - Git 머지 충돌이 난 DataTable(JSON/CSV/.uasset)을 칸 단위로 합치는 로컬 도구.
+  .uasset 은 언리얼 에디터를 화면 없이 띄워 JSON 으로 바꿔서 병합하고, 저장할 때 다시 에셋에 채운다.
 
 .DESCRIPTION
   머지 충돌 상태인 Git 저장소에서 실행하면
@@ -19,6 +20,13 @@ param(
   [string]$Repo = (Get-Location).Path,
   [int]$Port = 47813,
   [switch]$NoBrowser,
+  # .uasset DataTable 병합용 언리얼 엔진 폴더(예: E:\UE_5.8) 또는 UnrealEditor-Cmd.exe 경로.
+  # 생략하면 git config assetguard.engine, 환경변수 ASSETGUARD_ENGINE, .uproject 의 엔진 버전 순으로 찾음
+  [string]$Engine,
+  # .uproject 경로. 생략하면 저장소에서 찾음
+  [string]$Project,
+  # .uasset 충돌은 건드리지 않음 (언리얼을 띄우지 않음)
+  [switch]$NoUnreal,
   # Git 없이 화면/테스트 파일만 띄움 (개발용)
   [switch]$ServeOnly
 )
@@ -41,15 +49,20 @@ function Quote-Arg([string]$a) {
 }
 
 function Invoke-Git {
-  param([string[]]$GitArgs, [switch]$AllowFail, [switch]$Bytes)
+  param([string[]]$GitArgs, [switch]$AllowFail, [switch]$Bytes, [byte[]]$Stdin)
   $psi = New-Object Diagnostics.ProcessStartInfo
   $psi.FileName = 'git'
   $psi.Arguments = (@('-C', $script:RepoRoot) + $GitArgs | ForEach-Object { Quote-Arg $_ }) -join ' '
   $psi.UseShellExecute = $false
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
+  $psi.RedirectStandardInput = [bool]$Stdin
   $psi.CreateNoWindow = $true
   $p = [Diagnostics.Process]::Start($psi)
+  if ($Stdin) {  # small input (an LFS pointer), so writing it all before reading cannot deadlock
+    $p.StandardInput.BaseStream.Write($Stdin, 0, $Stdin.Length)
+    $p.StandardInput.Close()
+  }
   $ms = New-Object IO.MemoryStream
   $errTask = $p.StandardError.ReadToEndAsync()
   $p.StandardOutput.BaseStream.CopyTo($ms)
@@ -155,6 +168,169 @@ function Get-LastCommit([string]$rev, [string]$path) {
   return @{ hash = $parts[0]; author = $parts[1]; when = $parts[2]; subject = $parts[3] }
 }
 
+# ---------- .uasset DataTable: 언리얼 커맨드릿 연동 ----------
+# Git 의 세 버전 .uasset 을 꺼내(LFS 포인터면 풀어서) 언리얼을 화면 없이 한 번 띄워 JSON 으로 바꾸고,
+# 저장할 때는 결과 JSON 을 실제 에셋에 채워 저장한다. 방식은 ue/README.md 의 검증 결과를 따른다.
+
+function Get-UassetBytes([string]$sha, [string]$path) {
+  $bytes = Invoke-Git -GitArgs @('cat-file', 'blob', $sha) -Bytes
+  if ($null -eq $bytes) { $bytes = [byte[]]@() }
+  $head = [Text.Encoding]::ASCII.GetString($bytes, 0, [Math]::Min(40, $bytes.Length))
+  if ($head.StartsWith('version https://git-lfs.github.com/spec/')) {
+    $real = Invoke-Git -GitArgs @('lfs', 'smudge', '--', $path) -Bytes -Stdin $bytes -AllowFail
+    if ($null -eq $real) { throw 'Git LFS 포인터를 풀지 못했어요 (git lfs install / git lfs fetch 확인)' }
+    $bytes = $real
+  }
+  if ($bytes.Length -lt 4 -or $bytes[0] -ne 0xC1 -or $bytes[1] -ne 0x83 -or $bytes[2] -ne 0x2A -or $bytes[3] -ne 0x9E) {
+    throw '.uasset 형식이 아니에요'
+  }
+  return , $bytes
+}
+
+function Find-Project {
+  if ($Project) { return [IO.Path]::GetFullPath($Project) }
+  $found = @(Get-ChildItem -LiteralPath $script:RepoRoot -Filter '*.uproject' -File -ErrorAction SilentlyContinue)
+  if (-not $found.Count) { $found = @(Get-ChildItem -LiteralPath $script:RepoRoot -Filter '*.uproject' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue) }
+  if ($found.Count) { return $found[0].FullName }
+  return $null
+}
+
+# -Engine, git config assetguard.engine, ASSETGUARD_ENGINE, then the .uproject's engine version
+# (Epic launcher records, registry, and X:\UE_<ver> style folders on every drive).
+function Find-EngineCmd([string]$uproject) {
+  $cands = @()
+  if ($Engine) { $cands += $Engine }
+  $cfg = Invoke-Git -GitArgs @('config', 'assetguard.engine') -AllowFail
+  if ($cfg) { $cands += $cfg.Trim() }
+  if ($env:ASSETGUARD_ENGINE) { $cands += $env:ASSETGUARD_ENGINE }
+  $assoc = $null
+  try { $assoc = (Get-Content -LiteralPath $uproject -Raw | ConvertFrom-Json).EngineAssociation } catch {}
+  if ($assoc) {
+    $dat = Join-Path $env:ProgramData 'Epic\UnrealEngineLauncher\LauncherInstalled.dat'
+    if (Test-Path -LiteralPath $dat) {
+      try { (Get-Content -LiteralPath $dat -Raw | ConvertFrom-Json).InstallationList | Where-Object { $_.AppName -eq "UE_$assoc" } | ForEach-Object { $cands += $_.InstallLocation } } catch {}
+    }
+    $builds = Get-ItemProperty 'HKCU:\Software\Epic Games\Unreal Engine\Builds' -ErrorAction SilentlyContinue
+    if ($builds -and $builds.PSObject.Properties[$assoc]) { $cands += $builds.$assoc }
+    $key = Get-ItemProperty "HKLM:\SOFTWARE\EpicGames\Unreal Engine\$assoc" -ErrorAction SilentlyContinue
+    if ($key -and $key.InstalledDirectory) { $cands += $key.InstalledDirectory }
+    foreach ($root in (Get-PSDrive -PSProvider FileSystem).Root) {
+      $cands += (Join-Path $root "UE_$assoc"), (Join-Path $root "Epic Games\UE_$assoc"), (Join-Path $root "Program Files\Epic Games\UE_$assoc")
+    }
+  }
+  foreach ($c in $cands) {
+    if (-not $c) { continue }
+    $exe = if ($c -like '*.exe') { $c } else { Join-Path $c 'Engine\Binaries\Win64\UnrealEditor-Cmd.exe' }
+    if (Test-Path -LiteralPath $exe) { return $exe }
+  }
+  return $null
+}
+
+function Test-EditorOpen([string]$uproject) {
+  $name = [IO.Path]::GetFileName($uproject)
+  $procs = @(Get-CimInstance Win32_Process -Filter "Name='UnrealEditor.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$name*" })
+  return $procs.Count -gt 0
+}
+
+function Get-ShortPath([string]$folder) {
+  if ($folder -notmatch ' ') { return $folder }
+  try { return (New-Object -ComObject Scripting.FileSystemObject).GetFolder($folder).ShortPath } catch { return $folder }
+}
+
+# Runs ue/assetguard_bridge.py once in a headless editor. Arguments go through environment
+# variables because a path with a space cannot be quoted inside -script="..." on the command line.
+function Invoke-Bridge([string]$mode, $items) {
+  $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+  $manifest = Join-Path $script:UeWork "$mode-$id.json"
+  $out = Join-Path $script:UeWork "$mode-$id-out.json"
+  $log = Join-Path $script:UeWork "$mode-$id.log"
+  [IO.File]::WriteAllText($manifest, (ConvertTo-Json -InputObject @{ run = $id; items = @($items) } -Depth 6), $Utf8NoBom)
+  $bridge = Join-Path $script:UeWork 'assetguard_bridge.py'
+  Copy-Item -LiteralPath (Join-Path $ToolRoot 'ue\assetguard_bridge.py') -Destination $bridge -Force
+  $env:ASSETGUARD_MODE = $mode; $env:ASSETGUARD_MANIFEST = $manifest; $env:ASSETGUARD_OUT = $out
+  $argLine = "`"$($script:UeProject)`" -run=pythonscript -script=`"$($bridge -replace '\\', '/')`" " +
+             "-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities -unattended -nosplash -nullrhi -nop4 -stdout -FullStdOutLogOutput"
+  $t0 = Get-Date
+  try {
+    $p = Start-Process -FilePath $script:UeCmd -ArgumentList $argLine -NoNewWindow -Wait -PassThru -RedirectStandardOutput $log
+  } finally {
+    Remove-Item Env:ASSETGUARD_MODE, Env:ASSETGUARD_MANIFEST, Env:ASSETGUARD_OUT -ErrorAction SilentlyContinue
+  }
+  Write-Info ("언리얼 {0}: {1:N0}초" -f $mode, ((Get-Date) - $t0).TotalSeconds)
+  if (-not (Test-Path -LiteralPath $out)) { throw "언리얼이 결과를 남기지 않았어요 (종료 코드 $($p.ExitCode)). 로그: $log" }
+  return , @((Get-Content -LiteralPath $out -Raw -Encoding UTF8 | ConvertFrom-Json).items)
+}
+
+function Read-UassetConflicts($uassets, $op) {
+  $files = @(); $skipped = @()
+  $reason = $null
+  if ($NoUnreal) { $reason = '-NoUnreal 옵션이라 .uasset 은 건드리지 않았어요' }
+  if (-not $reason) {
+    $script:UeProject = Find-Project
+    if (-not $script:UeProject) { $reason = '저장소에서 .uproject 를 찾지 못했어요 (-Project 로 지정하세요)' }
+  }
+  if (-not $reason) {
+    $script:UeCmd = Find-EngineCmd $script:UeProject
+    if (-not $script:UeCmd) { $reason = '언리얼 엔진을 찾지 못했어요 (-Engine E:\UE_5.8 처럼 지정하거나 git config --global assetguard.engine 으로 설정하세요)' }
+  }
+  if (-not $reason -and (Test-EditorOpen $script:UeProject)) {
+    $reason = '언리얼 에디터가 이 프로젝트를 열고 있어요. 저장이 엇갈리지 않게 에디터를 닫고 다시 실행하세요'
+  }
+  if ($reason) {
+    foreach ($u in $uassets) { $skipped += @{ path = $u.path; reason = $reason } }
+    return @{ files = $files; skipped = $skipped }
+  }
+
+  $work = Join-Path $env:TEMP ('assetguard-' + $script:Token.Substring(0, 8))
+  New-Item -ItemType Directory -Force $work | Out-Null
+  $script:UeWork = Get-ShortPath $work
+  $contentDir = [IO.Path]::GetFullPath((Join-Path (Split-Path $script:UeProject -Parent) 'Content')) + '\'
+  $items = @(); $byId = @{}; $i = 0
+  foreach ($u in $uassets) {
+    $full = [IO.Path]::GetFullPath((Join-Path $script:RepoRoot $u.path))
+    if (-not $full.StartsWith($contentDir, [StringComparison]::OrdinalIgnoreCase)) {
+      $skipped += @{ path = $u.path; reason = '프로젝트 Content 폴더 밖의 에셋(플러그인 등)은 아직 지원하지 않아요' }; continue
+    }
+    $pkg = '/Game/' + ($full.Substring($contentDir.Length) -replace '\\', '/' -replace '\.uasset$', '')
+    $id = [string]$i; $i++
+    $dir = Join-Path $script:UeWork $id
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $st = @{ base = $null; ours = $null; theirs = $null }
+    try {
+      foreach ($pair in @(@('base', 1), @('ours', $op.meStage), @('theirs', $op.themStage))) {
+        if (-not $u.stages.ContainsKey($pair[1])) { continue }
+        $file = Join-Path $dir "$($pair[0]).uasset"
+        [IO.File]::WriteAllBytes($file, (Get-UassetBytes $u.stages[$pair[1]] $u.path))
+        $st[$pair[0]] = $file -replace '\\', '/'
+      }
+    } catch {
+      $skipped += @{ path = $u.path; reason = $_.Exception.Message }; continue
+    }
+    $items += @{ id = $id; pkg = $pkg; stages = $st }
+    $byId[$id] = @{ path = $u.path; pkg = $pkg; oursFile = ($st.ours -replace '/', '\') }
+  }
+  if (-not $items.Count) { return @{ files = $files; skipped = $skipped } }
+
+  Write-Info "언리얼 에디터를 화면 없이 띄워서 .uasset $($items.Count)개를 읽는 중이에요 (1~2분)..."
+  try { $results = Invoke-Bridge 'export' $items }
+  catch {
+    foreach ($it in $items) { $skipped += @{ path = $byId[$it.id].path; reason = $_.Exception.Message } }
+    return @{ files = $files; skipped = $skipped }
+  }
+  foreach ($r in $results) {
+    $meta = $byId[[string]$r.id]
+    if (-not $r.ok) { $skipped += @{ path = $meta.path; reason = [string]$r.error }; continue }
+    $f = @{ path = $meta.path; kind = 'uasset'; pkg = $meta.pkg; rowStruct = $r.row_struct
+            base = $r.base; ours = $r.ours; theirs = $r.theirs; oursFile = $meta.oursFile; encoding = 'utf8'; commits = @{} }
+    if ($op.meRev) { $f.commits.ours = Get-LastCommit $op.meRev $meta.path }
+    if ($op.themRev) { $f.commits.theirs = Get-LastCommit $op.themRev $meta.path }
+    if ($op.baseRev) { $f.commits.base = Get-LastCommit $op.baseRev $meta.path }
+    $files += $f
+  }
+  return @{ files = $files; skipped = $skipped }
+}
+
 # ---------- 충돌 세션 만들기 ----------
 function New-Session {
   $unmerged = Invoke-Git -GitArgs @('ls-files', '-u', '-z')
@@ -170,12 +346,11 @@ function New-Session {
 
   $op = Get-Operation
 
-  $files = @(); $skipped = @()
+  $files = @(); $skipped = @(); $uassets = @()
   foreach ($path in $byPath.Keys) {
     $ext = [IO.Path]::GetExtension($path).ToLower()
-    if ($DataTableExt -notcontains $ext) {
-      $reason = if ($ext -eq '.uasset') { '.uasset 직접 병합은 다음 단계(언리얼 에디터 연동)에서 지원 예정' } else { 'DataTable(JSON/CSV) 파일이 아님' }
-      $skipped += @{ path = $path; reason = $reason }
+    if ($DataTableExt -notcontains $ext -and $ext -ne '.uasset') {
+      $skipped += @{ path = $path; reason = 'DataTable(JSON/CSV/.uasset) 파일이 아님' }
       continue
     }
     $stages = $byPath[$path]
@@ -184,6 +359,7 @@ function New-Session {
       $skipped += @{ path = $path; reason = "$who 쪽에서 파일을 삭제했어요. 파일을 남길지(git add) 지울지(git rm) 먼저 정하세요." }
       continue
     }
+    if ($ext -eq '.uasset') { $uassets += @{ path = $path; stages = $stages }; continue }
     $blobs = @{}
     $err = $null
     foreach ($s in @(1, $op.meStage, $op.themStage)) {
@@ -199,6 +375,11 @@ function New-Session {
     if ($op.themRev) { $f.commits.theirs = Get-LastCommit $op.themRev $path }
     if ($op.baseRev) { $f.commits.base = Get-LastCommit $op.baseRev $path }
     $files += $f
+  }
+
+  if ($uassets.Count) {
+    $r = Read-UassetConflicts $uassets $op
+    $files += $r.files; $skipped += $r.skipped
   }
 
   return @{
@@ -267,7 +448,18 @@ function Resolve-File($body) {
   $still = Invoke-Git -GitArgs @('ls-files', '-u', '--', $path)
   if (-not $file.resolved -and -not $still) { throw "$path 는 이미 다른 방법으로 해결됐어요. 덮어쓰지 않았어요." }
   $target = [IO.Path]::GetFullPath((Join-Path $script:RepoRoot $path))
-  [IO.File]::WriteAllText($target, [string]$data.content, (Get-Encoding $file.encoding))
+  if ($file.kind -eq 'uasset') {
+    # Start from my version (what Git leaves in the working tree for a binary conflict),
+    # then let Unreal fill in the merged rows and save. The bridge re-reads and compares.
+    [IO.File]::Copy($file.oursFile, $target, $true)
+    $jsonFile = Join-Path $script:UeWork ('merged-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
+    [IO.File]::WriteAllText($jsonFile, [string]$data.content, $Utf8NoBom)
+    Write-Info "언리얼에서 $path 저장 중이에요 (1~2분)..."
+    $res = Invoke-Bridge 'import' @(@{ id = '0'; pkg = $file.pkg; json_file = ($jsonFile -replace '\\', '/') })
+    if (-not $res[0].ok) { throw "언리얼 저장 실패: $($res[0].error)" }
+  } else {
+    [IO.File]::WriteAllText($target, [string]$data.content, (Get-Encoding $file.encoding))
+  }
   Invoke-Git -GitArgs @('add', '--', $path) | Out-Null
   $file.resolved = $true
   Write-Info "저장 + git add: $path"
@@ -359,6 +551,7 @@ try {
   }
 } finally {
   $listener.Stop(); $listener.Close()
+  if ($script:UeWork -and (Test-Path -LiteralPath $script:UeWork)) { Remove-Item -LiteralPath $script:UeWork -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 if (-not $ServeOnly) {

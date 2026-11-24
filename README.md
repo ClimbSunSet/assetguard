@@ -1,6 +1,6 @@
 # AssetGuard MVP
 
-Git 머지 충돌이 난 **DataTable을 칸 단위로 합치고, 칸마다 출처(원본·나·상대)를 보여주는** 로컬 도구입니다.
+Git 머지 충돌이 난 **DataTable(JSON·CSV·`.uasset`)을 칸 단위로 합치고, 칸마다 출처(원본·나·상대)를 보여주는** 로컬 도구입니다.
 사업계획서 1분기 일정에 있는 "3-way 비교·자동 병합 프로토타입"과 "출처 표시 화면·진짜 충돌 선택 화면"을 구현했습니다.
 
 - **별도 서버 없음**: Windows 기본 PowerShell과 Git만 씁니다. 설치할 것이 없습니다.
@@ -41,7 +41,8 @@ git assetguard             # 병합 화면이 브라우저로 열림 → 고르�
 git commit                 # 머지 마무리
 ```
 
-옵션: `-Repo <경로>`, `-Port <번호>` (기본 47813, 사용 중이면 다음 번호를 씀), `-NoBrowser`
+옵션: `-Repo <경로>`, `-Port <번호>` (기본 47813, 사용 중이면 다음 번호를 씀), `-NoBrowser`,
+`.uasset`용 `-Engine <엔진 폴더>`, `-Project <.uproject>`, `-NoUnreal`
 
 병합 화면은 실행할 때마다 새 토큰을 받습니다. 그래서 예전 실행에서 열어둔 탭으로는 저장할 수 없고, 그사이 다른 방법으로 해결된 파일도 덮어쓰지 않습니다.
 
@@ -101,14 +102,45 @@ git commit                 # 머지 마무리
 |---|---|
 | 지원 | DataTable **JSON** (언리얼 "JSON으로 익스포트" 형식: `[{"Name": ..., ...}]`) |
 | 지원 | DataTable **CSV** (첫 열이 행 이름, 헤더 첫 칸 `---`) |
-| 미지원 | **`.uasset` 직접 병합.** 충돌 목록에는 "건너뜀"으로 표시됩니다 |
+| 지원 | **`.uasset` DataTable** (언리얼 엔진 필요. 아래 설명 참고) |
+| 미지원 | 데이터에셋, 블루프린트 등 DataTable이 아닌 `.uasset`, 플러그인 Content 폴더의 에셋 |
 
-`.uasset`을 다루려면 언리얼 에디터와 연결해야 합니다. 계획은 이렇습니다.
-Git의 세 버전 `.uasset`을 임시 에셋으로 불러와 에디터 Python의 `DataTableFunctionLibrary`로 JSON을 뽑고,
-이 도구의 병합 엔진(`web/merge.js`)으로 합친 뒤, 결과 JSON을 다시 DataTable에 채워 저장합니다.
-사업계획서에 "[기술 검증 필요]"로 적힌 "임시 버전 에셋 불러오기" 단계가 여기에 해당합니다.
-이 단계를 확인하는 검증 스크립트가 [`ue/`](ue/README.md)에 있습니다.
-UE 5.8.4 검증용 프로젝트에서는 JSON 왕복, Git LFS에서 꺼낸 과거 버전 불러오기, 원본 무변경 검사가 모두 통과했습니다.
+### `.uasset` DataTable 병합
+
+`.uasset` 충돌이 있으면 언리얼 에디터를 **화면 없이**(커맨드릿) 띄워서 처리합니다.
+
+1. Git에서 세 버전(공통 원본·나·상대)의 `.uasset`을 꺼냅니다. LFS 포인터면 실제 파일로 풉니다.
+2. 언리얼을 한 번 띄워서 세 버전을 모두 DataTable JSON으로 바꿉니다.
+3. JSON/CSV 때와 같은 병합 화면에서 합칩니다.
+4. 저장하면 언리얼이 결과를 작업 폴더의 실제 에셋에 채우고 저장합니다. 그다음 저장된 에셋을 **다시 읽어서 병합 결과와 똑같은지 확인**한 뒤 `git add` 합니다.
+
+언리얼 엔진은 다음 순서로 찾습니다. 못 찾으면 `.uasset`은 이유와 함께 건너뜁니다.
+- `-Engine E:\UE_5.8` 옵션
+- `git config --global assetguard.engine E:\UE_5.8`
+- 환경변수 `ASSETGUARD_ENGINE`
+- `.uproject`의 엔진 버전 (Epic 런처 기록, 레지스트리, 각 드라이브의 `UE_<버전>` 폴더)
+
+알아둘 점:
+- **에디터가 그 프로젝트를 열고 있으면 `.uasset`은 건드리지 않습니다.** 에디터 안의 내용과 저장이 엇갈리지 않게 하기 위해서입니다. 닫고 다시 실행하세요.
+- 플러그인은 `.uproject`를 고치지 않고 실행 인수로만 켭니다(`-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities`).
+- 언리얼을 한 번 띄울 때마다 시간이 걸립니다. 처음 읽을 때 한 번, 파일을 저장할 때마다 한 번씩 띄웁니다. 검증용 프로젝트에서는 각각 약 11초였습니다.
+- `.uasset`을 아예 건드리지 않으려면 `-NoUnreal` 옵션을 쓰세요.
+
+실제 `.uasset` 충돌로 데모하려면 다음 두 스크립트를 쓰면 됩니다. 검증용 프로젝트에 충돌을 만들고, 그 충돌에 AssetGuard를 실행합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ue\make-spike-project.ps1 -Engine E:\UE_5.8
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ue\make-uasset-conflict.ps1 -Engine E:\UE_5.8
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File assetguard.ps1 -Repo D:\AssetGuardSpike -Engine E:\UE_5.8
+```
+
+이 방식이 되는지는 [`ue/`](ue/README.md)의 검증 스크립트로 먼저 확인했습니다. 검증용 프로젝트와 팀 프로젝트에서 JSON 왕복, Git LFS에서 꺼낸 과거 버전 불러오기, 원본 무변경 검사가 모두 통과했습니다.
 
 ## 구조
 
@@ -122,6 +154,8 @@ web/index.html, app.js  병합 화면: 출처 색 표시, 확인할 곳만 모�
 tests/merge.test.html   병합 엔진·포맷 테스트 37개
 tests/ue_spike.test.html  UE 검증 스크립트 로직 테스트 6개 (Pyodide, 가짜 unreal 모듈)
 ue/spike_datatable.py   UE 연동 기술 검증 스크립트 (에디터 Python)
+ue/assetguard_bridge.py .uasset ↔ JSON 변환 (assetguard.ps1이 커맨드릿으로 실행)
+ue/make-uasset-conflict.ps1  검증용 프로젝트에 실제 .uasset 머지 충돌 만들기
 demo/make-demo-repo.ps1 충돌 재현용 데모 저장소 생성
 ```
 

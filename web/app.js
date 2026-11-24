@@ -178,6 +178,7 @@
       stat(st.deleted, '삭제된 행') +
       stat(total, '직접 확인할 곳' + (total ? ' (남은 ' + left + ')' : ''), total ? 'warn' : 'good') +
       '<div class="stat" style="grid-column: 1 / -1"><span class="l">' +
+        (e.raw.kind === 'uasset' ? '언리얼 에셋(.uasset) · 행 구조체 <b>' + esc(e.raw.rowStruct || '?') + '</b><br>' : '') +
         '<span class="chip src-ours">나</span> ' + esc(commitText(c.ours) || L.ours) + '<br>' +
         '<span class="chip src-theirs">상대</span> ' + esc(commitText(c.theirs) || L.theirs) +
         (c.base ? '<br><span class="chip src-base">원본</span> ' + esc(commitText(c.base)) : '') +
@@ -345,6 +346,7 @@
     hint.textContent = left ? '확인할 곳 ' + left + '곳을 모두 고르면 저장할 수 있어요.'
       : e.saved ? '저장하고 git add까지 끝냈어요.'
       : state.demo ? '데모라서 파일은 안 쓰고 결과만 보여줘요.'
+      : e.raw.kind === 'uasset' ? '언리얼 에디터를 화면 없이 띄워 결과를 에셋에 채우고 저장한 뒤 git add 해요 (1~2분 걸려요).'
       : '결과를 ' + e.raw.path + '에 쓰고 git add 해요.';
   }
 
@@ -359,6 +361,10 @@
       return;
     }
     $('save').disabled = true;
+    if (e.raw.kind === 'uasset') {
+      $('save').textContent = '언리얼에서 저장 중…';
+      banner('언리얼 에디터가 화면 없이 ' + esc(e.raw.path) + '에 결과를 채우고 저장하는 중이에요. 1~2분 걸려요.', 'info');
+    }
     // Pilot metrics (사업계획서 1분기 지표): how long it took and how much was automatic.
     var st = e.result.stats, choices = Object.keys(e.choices).map(function (k) { return e.choices[k]; });
     var metrics = {

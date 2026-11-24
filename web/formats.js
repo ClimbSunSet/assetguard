@@ -10,6 +10,7 @@
   function detect(path, text) {
     var lower = (path || '').toLowerCase();
     if (lower.endsWith('.json')) return 'json';
+    if (lower.endsWith('.uasset')) return 'json'; // the server sends Unreal's JSON export of the DataTable
     if (lower.endsWith('.csv')) return 'csv';
     var t = (text || '').trim();
     return t.charAt(0) === '[' ? 'json' : 'csv';
