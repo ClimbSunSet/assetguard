@@ -210,7 +210,10 @@ def check_revision(pkg, original_rows, rev, git_root):
 
     code, blob, err = run(["git", "show", "%s:%s" % (rev, rel)], git_root)
     if code != 0:
-        out.update(ok=False, detail="git show 실패: " + err)
+        if "exists on disk, but not in" in err or "does not exist in" in err:
+            out.update(ok=None, detail="%s 시점에는 이 파일이 없어서 건너뜀" % rev)
+        else:
+            out.update(ok=False, detail="git show 실패: " + err)
         return out
     if blob.startswith(b"version https://git-lfs.github.com/spec/"):
         out["lfs_pointer"] = True
@@ -263,8 +266,22 @@ def check_revision(pkg, original_rows, rev, git_root):
         diff = first_difference(original_rows, rev_rows)
         out.update(ok=diff is None, detail=diff or "작업 파일과 같은 버전이고 내용도 같음")
     else:
-        out.update(ok=True, detail="작업 파일과 다른 버전을 불러옴 (행 %d개). 내용 비교는 생략" % len(rev_rows))
+        now = {r.get("Name"): r for r in original_rows}
+        then = {r.get("Name"): r for r in rev_rows}
+        added = [n for n in now if n not in then]
+        removed = [n for n in then if n not in now]
+        changed = [n for n in now if n in then and first_difference(then[n], now[n])]
+        out.update(rows_added_since=added, rows_removed_since=removed, rows_changed_since=changed)
+        out.update(ok=True, detail="다른 버전을 불러옴 (행 %d개). 그 뒤로 추가 %s / 삭제 %s / 수정 %s" % (
+            len(rev_rows), names_text(added), names_text(removed), names_text(changed)))
     return out
+
+
+def names_text(names, limit=5):
+    if not names:
+        return "없음"
+    more = " 외 %d개" % (len(names) - limit) if len(names) > limit else ""
+    return ", ".join(str(n) for n in names[:limit]) + more
 
 
 def cleanup_temp():
@@ -354,7 +371,7 @@ def main():
 
 
 def mark(ok):
-    return "통과" if ok else "실패"
+    return "건너뜀" if ok is None else ("통과" if ok else "실패")
 
 
 def print_summary(report, out_path):
@@ -375,7 +392,8 @@ def print_summary(report, out_path):
             lfs = "LFS 관리" if rv.get("lfs_attr") else "LFS 아님"
             if rv.get("lfs_pointer"):
                 lfs += ", 포인터 풀기 성공"
-            log("  2) 과거 버전 : %s - %s (%s, %s, %ss)" % (mark(rv.get("ok")), rv.get("detail"), rv["rev"], rv.get("load_method") or "-", rv.get("load_seconds", "-")))
+            how = ", %s, %ss" % (rv["load_method"], rv.get("load_seconds")) if rv.get("load_method") else ""
+            log("  2) 과거 버전 : %s - %s (%s%s)" % (mark(rv.get("ok")), rv.get("detail"), rv["rev"], how))
             log("  3) Git LFS   : %s" % lfs)
         log("  원본 변경 없음: %s" % mark(t.get("original_untouched")))
     log("임시 폴더 정리: " + report.get("temp_cleanup", "-"))

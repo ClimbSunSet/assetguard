@@ -26,7 +26,7 @@ ROWS = [
     {"Name": "Orc", "HP": 250, "Speed": 2.0, "Alive": False, "Mesh": "/Game/M/SK_Orc.SK_Orc", "Tags": [], "Stats": {"Str": 5}},
 ]
 
-def build_unreal(lossy=False, pointer=True, magic_ok=True, workfile_matches=True, rev_rows=None):
+def build_unreal(lossy=False, pointer=True, magic_ok=True, workfile_matches=True, rev_rows=None, missing_at_rev=False):
     u = types.ModuleType('unreal')
     u.logs = []
     u.log = lambda m: u.logs.append(m)
@@ -108,17 +108,19 @@ def build_unreal(lossy=False, pointer=True, magic_ok=True, workfile_matches=True
     u.git_calls = []
     def fake_run(cmd, cwd=None, input=None, stdout=None, stderr=None, creationflags=0):
         u.git_calls.append(cmd)
-        out, code = b'', 0
+        out, code, err = b'', 0, b''
         if cmd[1:3] == ['rev-parse', '--show-toplevel']: out = b'/proj\n'
         elif cmd[1:3] == ['lfs', 'version']: out = b'git-lfs/3'
         elif cmd[1] == 'check-attr': out = (cmd[-1] + ': filter: lfs\n').encode()
         elif cmd[1] == 'show':
-            assert cmd[2] == 'HEAD:Content/Data/DT_Monsters.uasset', cmd
+            assert cmd[2].endswith(':Content/Data/DT_Monsters.uasset'), cmd
+            if missing_at_rev:
+                code, err = 128, b"fatal: path 'Content/Data/DT_Monsters.uasset' exists on disk, but not in 'abc123'"
             out = pointer_bytes if pointer else blob
         elif cmd[1:3] == ['lfs', 'smudge']:
             assert input == pointer_bytes; out = blob
         elif cmd[1] == 'diff': code = 0 if workfile_matches else 1
-        return types.SimpleNamespace(returncode=code, stdout=out, stderr=b'')
+        return types.SimpleNamespace(returncode=code, stdout=out, stderr=err)
     subprocess.run = fake_run
     return u
 
@@ -173,9 +175,19 @@ def t_revision_differs():
     assert rv['ok'] is False and 'HP' in rv['detail'], rv   # same rev as workfile but content differs -> must fail
 
 def t_other_version():
-    u, rep = run_script(['--rev=HEAD'], workfile_matches=False, pointer=False)
+    # Older version: Orc did not exist yet and Goblin had less HP.
+    old = [dict(ROWS[0], HP=90)]
+    u, rep = run_script(['--rev=HEAD~1'], workfile_matches=False, pointer=False, rev_rows=old)
     rv = rep['tables'][0]['revision']
-    assert rv['ok'] is True and rv['lfs_pointer'] is False and '생략' in rv['detail'], rv
+    assert rv['ok'] is True and rv['lfs_pointer'] is False, rv
+    assert rv['rows_added_since'] == ['Orc'] and rv['rows_removed_since'] == [] and rv['rows_changed_since'] == ['Goblin'], rv
+    assert '추가 Orc' in rv['detail'] and '수정 Goblin' in rv['detail'], rv['detail']
+
+def t_missing_at_rev():
+    u, rep = run_script(['--rev=abc123'], missing_at_rev=True)
+    rv = rep['tables'][0]['revision']
+    assert rv['ok'] is None and '건너뜀' in rv['detail'], rv
+    assert any('2) 과거 버전 : 건너뜀' in l for l in u.logs), u.logs
 
 def t_commandlet_args():
     u, rep = run_script(['/Game/Data/DT_Monsters --keep'])
@@ -186,7 +198,8 @@ test('정상: 왕복·과거 버전(LFS 포인터 풀기)·원본 무변경·임
 test('가져오기에서 값이 빠지면 왕복 실패로 보고', t_lossy)
 test('.uasset 형식이 아닌 파일은 실패로 보고', t_bad_magic)
 test('같은 버전인데 내용이 다르면 실패로 보고', t_revision_differs)
-test('작업 파일과 다른 버전이면 비교 생략, LFS 아닌 저장소', t_other_version)
+test('다른 버전이면 추가·삭제·수정된 행을 보고, LFS 아닌 저장소', t_other_version)
+test('그 버전에 파일이 없으면 실패가 아니라 건너뜀', t_missing_at_rev)
 test('커맨드릿처럼 인수가 한 문자열로 와도 처리 (--keep)', t_commandlet_args)
 json.dumps(results)
 `;
