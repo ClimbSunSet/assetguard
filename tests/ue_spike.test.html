@@ -76,6 +76,9 @@ def build_unreal(lossy=False, pointer=True, magic_ok=True, workfile_matches=True
             for k in [k for k in store if k.startswith(p)]: store.pop(k)
             u.deleted_dir = p
     u.EditorAssetLibrary = EAL
+    # Module-level load by object path (no asset registry). The temp copy is never in store,
+    # like the real registry missing a freshly dropped file, so this fallback is exercised.
+    u.load_asset = lambda p: _load_asset(p.split('.')[0])
 
     def fill(t, s):
         rows = json.loads(s)
@@ -96,6 +99,7 @@ def build_unreal(lossy=False, pointer=True, magic_ok=True, workfile_matches=True
     u.Paths = Paths
     class Reg:
         def scan_paths_synchronous(s, paths, force=False): u.scanned = paths
+        def scan_files_synchronous(s, files, force=False): u.scanned = files
     u.AssetRegistryHelpers = types.SimpleNamespace(get_asset_registry=lambda: Reg())
     u.SystemLibrary = types.SimpleNamespace(get_engine_version=lambda: '5.8.0-test')
 
@@ -141,10 +145,14 @@ def t_all_pass():
     assert t['roundtrip']['ok'], t['roundtrip']
     assert t['revision']['ok'], t['revision']
     assert t['revision']['lfs_attr'] is True and t['revision']['lfs_pointer'] is True
+    assert t['revision']['load_method'] == '오브젝트 경로로 직접 로드', t['revision']
+    assert u.scanned == ['/proj/Content/__AssetGuard_Spike/rev/DT_Monsters.uasset'], u.scanned
     assert t['original_untouched'] is True
     assert t['row_struct']['kind'].startswith('블루프린트'), t['row_struct']
     assert {'숫자', 'bool', '배열', '구조체/맵', '에셋 경로'} <= set(t['value_kinds']), t['value_kinds']
     assert u.deleted_dir == '/Game/__AssetGuard_Spike'
+    assert rep['temp_cleanup'] == '삭제됨', rep['temp_cleanup']
+    assert not os.path.exists('/proj/Content/__AssetGuard_Spike')   # hand-copied file removed from disk too
     assert not [k for k in u.store if k.startswith('/Game/__AssetGuard_Spike')]
     assert any('전체 결과' in l for l in u.logs)
 

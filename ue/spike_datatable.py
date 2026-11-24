@@ -28,6 +28,7 @@ AssetGuard UE 연동 기술 검증 스크립트 (스파이크)
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -230,13 +231,25 @@ def check_revision(pkg, original_rows, rev, git_root):
     os.makedirs(os.path.dirname(temp_file), exist_ok=True)
     with open(temp_file, "wb") as f:
         f.write(blob)
-    unreal.AssetRegistryHelpers.get_asset_registry().scan_paths_synchronous([TEMP_ROOT + "/rev"], True)
+    # The asset registry does not always notice a file dropped in while the editor runs
+    # (seen on UE 5.8: a folder rescan picked up one of two copies, at random). Scan the exact
+    # file, and if the registry still misses it, load by object path, which skips the registry.
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    try:
+        registry.scan_files_synchronous([temp_file], True)
+    except Exception:
+        registry.scan_paths_synchronous([TEMP_ROOT + "/rev"], True)
 
     t0 = time.time()
-    loaded = EAL.load_asset(temp_pkg)
-    out["load_seconds"] = round(time.time() - t0, 2)
+    loaded, method = None, None
+    if EAL.does_asset_exist(temp_pkg):
+        loaded, method = EAL.load_asset(temp_pkg), "에셋 레지스트리 경유"
     if loaded is None:
-        out.update(ok=False, detail="load_asset 이 None (출력 로그의 LogLinker/LogUObjectGlobals 경고 확인)")
+        loaded, method = unreal.load_asset("%s.%s" % (temp_pkg, name)), "오브젝트 경로로 직접 로드"
+    out["load_seconds"] = round(time.time() - t0, 2)
+    out["load_method"] = method
+    if loaded is None:
+        out.update(ok=False, detail="불러오기 실패 (출력 로그의 LogLinker/LogUObjectGlobals 경고 확인)")
         return out
     if not isinstance(loaded, unreal.DataTable):
         out.update(ok=False, detail="불러온 객체가 DataTable 이 아님: " + loaded.get_class().get_name())
@@ -252,6 +265,32 @@ def check_revision(pkg, original_rows, rev, git_root):
     else:
         out.update(ok=True, detail="작업 파일과 다른 버전을 불러옴 (행 %d개). 내용 비교는 생략" % len(rev_rows))
     return out
+
+
+def cleanup_temp():
+    """Remove the temp folder from the project and from disk. Returns a status string.
+
+    On UE 5.8, delete_directory removed the registered assets but left the hand-copied
+    revision file on disk (it only logs a warning), so leftovers are removed directly,
+    after a garbage collection releases the loaded packages."""
+    try:
+        EAL.delete_directory(TEMP_ROOT)
+    except Exception as e:
+        warn("delete_directory 실패: %s" % e)
+    try:
+        unreal.SystemLibrary.collect_garbage()
+    except Exception:
+        pass
+    folder = os.path.dirname(content_file(TEMP_ROOT + "/x"))
+    if os.path.basename(folder) != TEMP_ROOT.rsplit("/", 1)[1]:  # never delete anything else
+        return "경로 확인 실패, 직접 지워주세요: " + folder
+    if os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+    if os.path.exists(folder):
+        left = [os.path.join(r, f) for r, _, fs in os.walk(folder) for f in fs]
+        warn("임시 폴더가 남았어요. 에디터를 닫고 직접 지워주세요: %s (%d개 파일)" % (folder, len(left)))
+        return "남음: %d개 파일 (%s)" % (len(left), folder)
+    return "삭제됨"
 
 
 # ---------------------------------------------------------------- main
@@ -303,11 +342,7 @@ def main():
             entry["error"] = "%s: %s" % (type(e).__name__, e)
             entry["traceback"] = traceback.format_exc()
 
-    if not keep:
-        try:
-            EAL.delete_directory(TEMP_ROOT)
-        except Exception as e:
-            warn("임시 폴더 삭제 실패, 직접 지워주세요 (%s): %s" % (TEMP_ROOT, e))
+    report["temp_cleanup"] = "남겨둠 (--keep)" if keep else cleanup_temp()
 
     saved = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_saved_dir())
     out_path = os.path.join(saved, "AssetGuard", "spike_report.json")
@@ -340,9 +375,10 @@ def print_summary(report, out_path):
             lfs = "LFS 관리" if rv.get("lfs_attr") else "LFS 아님"
             if rv.get("lfs_pointer"):
                 lfs += ", 포인터 풀기 성공"
-            log("  2) 과거 버전 : %s - %s (%s, 불러오기 %ss)" % (mark(rv.get("ok")), rv.get("detail"), rv["rev"], rv.get("load_seconds", "-")))
+            log("  2) 과거 버전 : %s - %s (%s, %s, %ss)" % (mark(rv.get("ok")), rv.get("detail"), rv["rev"], rv.get("load_method") or "-", rv.get("load_seconds", "-")))
             log("  3) Git LFS   : %s" % lfs)
         log("  원본 변경 없음: %s" % mark(t.get("original_untouched")))
+    log("임시 폴더 정리: " + report.get("temp_cleanup", "-"))
     log("=" * 60)
     log("전체 결과: " + out_path)
 
