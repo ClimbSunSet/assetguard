@@ -140,6 +140,92 @@
     eq(names(M.applyResolutions(r, {})), ['A', 'B']);
   });
 
+  // ----- 리뷰 반영: 조용히 틀리게 합치지 않기 -----
+  function throws(fn, pattern) {
+    var msg = null; try { fn(); } catch (e) { msg = e.message; }
+    if (msg === null) throw new Error('예외가 나야 하는데 안 남');
+    if (pattern && !pattern.test(msg)) throw new Error('예외 메시지가 다름: ' + msg);
+  }
+  function TC(cols, rows) { var t = T(rows); t.columns = cols; return t; }
+
+  test('중복 행 이름이면 병합 거부 (대소문자 무시)', function () {
+    var dup = { columns: ['HP'], rows: [{ name: 'Sedan', cells: { HP: 1 } }, { name: 'sedan', cells: { HP: 2 } }] };
+    throws(function () { M.merge3(null, dup, T({ A: { HP: 1 } })); }, /중복/);
+    throws(function () { F.parse('x.csv', '---,HP\nSedan,1\nSedan,2\n'); }, /중복/);
+    throws(function () { F.parse('x.json', '[{"Name":"A","HP":1},{"Name":"a","HP":2}]'); }, /중복/);
+  });
+  test('대소문자만 다른 행은 같은 행으로 합치고 경고', function () {
+    var r = M.merge3(T({ A: { HP: 1 } }), T({ A: { HP: 1 }, Slime: { HP: 5 } }), T({ A: { HP: 1 }, slime: { HP: 5 } }));
+    var out = M.applyResolutions(r, {});
+    eq(names(out), ['A', 'Slime']); eq(r.conflicts.length, 0); eq(r.warnings.length, 1);
+  });
+  test('2^53 넘는 정수와 2.000000 표기를 그대로 보존', function () {
+    var src = '[\n\t{\n\t\t"Name": "A",\n\t\t"Id": 9007199254740993,\n\t\t"F": 2.000000\n\t}\n]\n';
+    var t = F.parse('x.json', src); eq(F.write(t, t.style), src);
+  });
+  test('큰 정수의 마지막 자리 변경도 변경으로 감지', function () {
+    var b = F.parse('x.json', '[{"Name":"A","Id":9007199254740992}]');
+    var t = F.parse('x.json', '[{"Name":"A","Id":9007199254740993}]');
+    var r = M.merge3(b, b, t);
+    eq(M.canon(cell(r, 'A', 'Id').value), M.canon(new M.Num('9007199254740993'))); eq(cell(r, 'A', 'Id').source, 'theirs');
+  });
+  test('2.0과 2는 같은 값으로 비교', function () {
+    var r = M.merge3(T({ A: { F: new M.Num('2.0') } }), T({ A: { F: new M.Num('2') } }), T({ A: { F: new M.Num('2.000') } }));
+    eq(r.stats.autoCells, 0); eq(r.conflicts.length, 0);
+  });
+  test('한쪽이 지운 열은 다른 쪽이 안 건드렸으면 빠지고 경고', function () {
+    var base = TC(['HP', 'X'], { A: { HP: 1, X: 9 } });
+    var r = M.merge3(base, TC(['HP'], { A: { HP: 2 } }), base);
+    eq(r.columns, ['HP']); eq(r.warnings.length, 1);
+  });
+  test('한쪽이 지운 열을 다른 쪽이 고쳤으면 병합 거부', function () {
+    var base = TC(['HP', 'X'], { A: { HP: 1, X: 9 } });
+    throws(function () { M.merge3(base, TC(['HP'], { A: { HP: 1 } }), TC(['HP', 'X'], { A: { HP: 1, X: 10 } })); }, /열/);
+  });
+  test('한쪽이 지운 열에 다른 쪽이 새 행 값을 넣었으면 병합 거부', function () {
+    var base = TC(['HP', 'X'], { A: { HP: 1, X: 9 } });
+    throws(function () { M.merge3(base, TC(['HP'], { A: { HP: 1 } }), TC(['HP', 'X'], { A: { HP: 1, X: 9 }, B: { HP: 2, X: 3 } })); }, /열/);
+  });
+  test('결과 행이 0개여도 CSV 헤더 유지', function () {
+    var base = F.parse('x.csv', '---,HP,Speed\nA,"1","2"\n');
+    var empty = F.parse('x.csv', '---,HP,Speed\n');
+    var r = M.merge3(base, empty, base);
+    eq(F.write(M.applyResolutions(r, {}), base.style), '---,HP,Speed\n');
+  });
+  test('내가 새 열을 만들었는데 상대가 새 행을 추가하면 경고', function () {
+    var base = TC(['HP'], { A: { HP: 1 } });
+    var r = M.merge3(base, TC(['HP', 'Armor'], { A: { HP: 1, Armor: 5 } }), TC(['HP'], { A: { HP: 1 }, B: { HP: 2 } }));
+    eq(r.warnings.length, 1); eq(r.conflicts.length, 0);
+  });
+  test('한쪽 버전이 없으면(파일 삭제) 병합 거부', function () {
+    throws(function () { M.merge3(T({ A: { HP: 1 } }), null, T({ A: { HP: 2 } })); });
+  });
+  test('CSV: 중복 열·헤더 밖 값·닫히지 않은 따옴표는 거부', function () {
+    throws(function () { F.parse('x.csv', '---,HP,hp\nA,1,2\n'); }, /열 이름/);
+    throws(function () { F.parse('x.csv', '---,HP\nA,1,99\n'); }, /헤더보다/);
+    throws(function () { F.parse('x.csv', '---,HP\nA,"1\n'); }, /따옴표/);
+  });
+  test('CSV: 엑셀식 빈 꼬리 열은 무시', function () {
+    var t = F.parse('x.csv', '---,HP,,\nA,1,,\n');
+    eq(t.columns, ['HP']); eq(t.rows[0].cells.HP, '1');
+  });
+  test('NUL이 섞인 텍스트(UTF-16 등)는 거부', function () {
+    throws(function () { F.parse('x.csv', '-\u0000-\u0000'); }, /인코딩/);
+  });
+  test('LF 파일의 따옴표 안 CRLF가 파일 전체 줄바꿈을 바꾸지 않음', function () {
+    var t = F.parse('x.csv', '---,Desc\nA,"line1\r\nline2"\n');
+    eq(t.style.eol, '\n');
+  });
+  test('constructor 같은 이름의 열도 정상 처리', function () {
+    var r = M.merge3(TC(['constructor'], { A: { constructor: 1 } }), TC(['constructor'], { A: { constructor: 2 } }), TC(['constructor'], { A: { constructor: 1 } }));
+    eq(cell(r, 'A', 'constructor'), { value: 2, source: 'ours' });
+  });
+  test('앞 행을 내가 지운 자리에 상대가 추가한 행은 맨 위로 가지 않음', function () {
+    var base = T({ A: { x: 1 }, B: { x: 1 }, C: { x: 1 } });
+    var r = M.merge3(base, T({ A: { x: 1 }, C: { x: 1 } }), T({ A: { x: 1 }, B: { x: 1 }, N: { x: 2 }, C: { x: 1 } }));
+    eq(names(M.applyResolutions(r, {})), ['A', 'N', 'C']);
+  });
+
   var failed = results.filter(function (r) { return !r.ok; });
   document.getElementById('summary').innerHTML = failed.length
     ? '<span class="fail">' + failed.length + '개 실패</span> / ' + results.length + '개'

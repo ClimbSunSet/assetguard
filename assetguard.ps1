@@ -27,6 +27,8 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $ToolRoot = $PSScriptRoot
 $Utf8NoBom = New-Object Text.UTF8Encoding $false
+$Utf8Strict = New-Object Text.UTF8Encoding($false, $true)   # throws on invalid bytes instead of writing U+FFFD
+$script:Token = [guid]::NewGuid().ToString('N')              # ties the browser tab to this run
 $DataTableExt = @('.json', '.csv')
 
 function Write-Info($msg) { Write-Host "[AssetGuard] $msg" }
@@ -61,11 +63,88 @@ function Invoke-Git {
   return $Utf8NoBom.GetString($raw)
 }
 
+# Decode a blob without ever guessing: UTF-8 (with/without BOM) and UTF-16 with BOM are read
+# exactly; anything else (CP949 from Excel, UTF-16 without BOM, binary) is refused.
 function Get-Blob([string]$sha) {
   $bytes = Invoke-Git -GitArgs @('cat-file', 'blob', $sha) -Bytes
-  $bom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-  $start = if ($bom) { 3 } else { 0 }
-  return @{ text = $Utf8NoBom.GetString($bytes, $start, $bytes.Length - $start); bom = $bom }
+  if ($null -eq $bytes) { $bytes = [byte[]]@() }
+  $n = $bytes.Length
+  try {
+    if ($n -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+      $enc = 'utf8bom'; $text = $Utf8Strict.GetString($bytes, 3, $n - 3)
+    } elseif ($n -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+      $enc = 'utf16le'; $text = (New-Object Text.UnicodeEncoding($false, $false, $true)).GetString($bytes, 2, $n - 2)
+    } elseif ($n -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+      $enc = 'utf16be'; $text = (New-Object Text.UnicodeEncoding($true, $false, $true)).GetString($bytes, 2, $n - 2)
+    } else {
+      $enc = 'utf8'; $text = $Utf8Strict.GetString($bytes)
+    }
+  } catch {
+    return @{ error = 'UTF-8이 아닌 인코딩(CP949 등)이라 안전하게 읽을 수 없어요. UTF-8로 저장해서 커밋한 뒤 다시 시도하세요.' }
+  }
+  if ($text.IndexOf([char]0) -ge 0) { return @{ error = 'BOM 없는 UTF-16 또는 바이너리 파일로 보여요. UTF-8로 저장한 뒤 다시 시도하세요.' } }
+  if ($text.StartsWith('version https://git-lfs.github.com/spec/')) { return @{ error = 'Git LFS 포인터 파일이에요. LFS 파일은 아직 지원하지 않아요.' } }
+  return @{ text = $text; encoding = $enc }
+}
+
+function Get-Encoding([string]$name) {
+  switch ($name) {
+    'utf8bom' { return New-Object Text.UTF8Encoding $true }
+    'utf16le' { return New-Object Text.UnicodeEncoding($false, $true) }
+    'utf16be' { return New-Object Text.UnicodeEncoding($true, $true) }
+    default { return $Utf8NoBom }
+  }
+}
+
+function Test-GitPath([string]$name) {
+  $p = Invoke-Git -GitArgs @('rev-parse', '--git-path', $name) -AllowFail
+  if (-not $p) { return $null }
+  $full = [IO.Path]::GetFullPath((Join-Path $script:RepoRoot $p.Trim()))
+  if (Test-Path -LiteralPath $full) { return $full }
+  return $null
+}
+
+function Get-Ref([string]$ref) {
+  $v = Invoke-Git -GitArgs @('rev-parse', '-q', '--verify', $ref) -AllowFail
+  if ($v) { return $v.Trim() }
+  return $null
+}
+
+function Get-RefLabel([string]$rev) {
+  $n = Invoke-Git -GitArgs @('name-rev', '--name-only', '--exclude=tags/*', $rev) -AllowFail
+  if ($n) { $n = ($n.Trim() -replace '[~^]\d*$', '' -replace '^remotes/', '') }
+  if (-not $n -or $n -eq 'undefined') { $n = (Invoke-Git -GitArgs @('rev-parse', '--short', $rev)).Trim() }
+  return $n
+}
+
+# Which operation produced the conflict, and which index stage is "me" vs "them".
+# merge / cherry-pick / revert / stash: stage 2 = HEAD = me.  rebase: stage 2 = upstream, stage 3 = my commit.
+function Get-Operation {
+  $branch = (Invoke-Git -GitArgs @('rev-parse', '--abbrev-ref', 'HEAD')).Trim()
+  if (Get-Ref 'MERGE_HEAD') {
+    $base = Invoke-Git -GitArgs @('merge-base', 'HEAD', 'MERGE_HEAD') -AllowFail
+    return @{ op = 'merge'; meStage = 2; themStage = 3; me = $branch; them = (Get-RefLabel 'MERGE_HEAD')
+              meRev = 'HEAD'; themRev = 'MERGE_HEAD'; baseRev = $(if ($base) { $base.Trim() } else { $null }) }
+  }
+  $rebaseDir = Test-GitPath 'rebase-merge'
+  if (-not $rebaseDir) { $rebaseDir = Test-GitPath 'rebase-apply' }
+  if ($rebaseDir) {
+    $headName = Join-Path $rebaseDir 'head-name'
+    $me = if (Test-Path -LiteralPath $headName) { ([IO.File]::ReadAllText($headName)).Trim() -replace '^refs/heads/', '' } else { '내 커밋' }
+    $ontoFile = Join-Path $rebaseDir 'onto'
+    $them = if (Test-Path -LiteralPath $ontoFile) { Get-RefLabel (([IO.File]::ReadAllText($ontoFile)).Trim()) } else { 'upstream' }
+    return @{ op = 'rebase'; meStage = 3; themStage = 2; me = "$me (rebase 중인 내 커밋)"; them = $them
+              meRev = $(if (Get-Ref 'REBASE_HEAD') { 'REBASE_HEAD' } else { $null }); themRev = 'HEAD'; baseRev = $null }
+  }
+  if (Get-Ref 'CHERRY_PICK_HEAD') {
+    return @{ op = 'cherry-pick'; meStage = 2; themStage = 3; me = $branch; them = 'cherry-pick ' + (Get-RefLabel 'CHERRY_PICK_HEAD')
+              meRev = 'HEAD'; themRev = 'CHERRY_PICK_HEAD'; baseRev = $null }
+  }
+  if (Get-Ref 'REVERT_HEAD') {
+    return @{ op = 'revert'; meStage = 2; themStage = 3; me = $branch; them = '되돌리는 커밋 ' + (Get-RefLabel 'REVERT_HEAD')
+              meRev = 'HEAD'; themRev = $null; baseRev = $null }
+  }
+  return @{ op = 'other'; meStage = 2; themStage = 3; me = $branch; them = '다른 버전 (stash 등)'; meRev = 'HEAD'; themRev = $null; baseRev = $null }
 }
 
 function Get-LastCommit([string]$rev, [string]$path) {
@@ -89,12 +168,7 @@ function New-Session {
     $byPath[$path][[int]$stage] = $sha
   }
 
-  $ours = (Invoke-Git -GitArgs @('rev-parse', '--abbrev-ref', 'HEAD')).Trim()
-  $hasMergeHead = $null -ne (Invoke-Git -GitArgs @('rev-parse', '-q', '--verify', 'MERGE_HEAD') -AllowFail)
-  $theirsRev = if ($hasMergeHead) { 'MERGE_HEAD' } else { $null }
-  $theirs = if ($hasMergeHead) { ((Invoke-Git -GitArgs @('name-rev', '--name-only', 'MERGE_HEAD')).Trim() -replace '~\d+$', '') } else { '상대 버전' }
-  $baseRev = if ($hasMergeHead) { (Invoke-Git -GitArgs @('merge-base', 'HEAD', 'MERGE_HEAD') -AllowFail) } else { $null }
-  if ($baseRev) { $baseRev = $baseRev.Trim() }
+  $op = Get-Operation
 
   $files = @(); $skipped = @()
   foreach ($path in $byPath.Keys) {
@@ -105,20 +179,34 @@ function New-Session {
       continue
     }
     $stages = $byPath[$path]
-    $f = @{ path = $path; base = $null; ours = $null; theirs = $null; bom = $false; commits = @{} }
-    if ($stages.ContainsKey(1)) { $f.base = (Get-Blob $stages[1]).text }
-    if ($stages.ContainsKey(2)) { $b = Get-Blob $stages[2]; $f.ours = $b.text; $f.bom = $b.bom }
-    if ($stages.ContainsKey(3)) { $f.theirs = (Get-Blob $stages[3]).text }
-    $f.commits.ours = Get-LastCommit 'HEAD' $path
-    if ($theirsRev) { $f.commits.theirs = Get-LastCommit $theirsRev $path }
-    if ($baseRev) { $f.commits.base = Get-LastCommit $baseRev $path }
+    if (-not $stages.ContainsKey($op.meStage) -or -not $stages.ContainsKey($op.themStage)) {
+      $who = if ($stages.ContainsKey($op.meStage)) { '상대' } else { '내' }
+      $skipped += @{ path = $path; reason = "$who 쪽에서 파일을 삭제했어요. 파일을 남길지(git add) 지울지(git rm) 먼저 정하세요." }
+      continue
+    }
+    $blobs = @{}
+    $err = $null
+    foreach ($s in @(1, $op.meStage, $op.themStage)) {
+      if (-not $stages.ContainsKey($s)) { continue }
+      $blobs[$s] = Get-Blob $stages[$s]
+      if ($blobs[$s].error) { $err = $blobs[$s].error }
+    }
+    if ($err) { $skipped += @{ path = $path; reason = $err }; continue }
+    $f = @{ path = $path; base = $null; ours = $blobs[$op.meStage].text; theirs = $blobs[$op.themStage].text
+            encoding = $blobs[$op.meStage].encoding; commits = @{} }
+    if ($blobs.ContainsKey(1)) { $f.base = $blobs[1].text }
+    if ($op.meRev) { $f.commits.ours = Get-LastCommit $op.meRev $path }
+    if ($op.themRev) { $f.commits.theirs = Get-LastCommit $op.themRev $path }
+    if ($op.baseRev) { $f.commits.base = Get-LastCommit $op.baseRev $path }
     $files += $f
   }
 
   return @{
     mode = 'git'
+    token = $script:Token
     repo = $script:RepoRoot
-    labels = @{ base = '공통 원본'; ours = $ours; theirs = $theirs }
+    op = $op.op
+    labels = @{ base = '공통 원본'; ours = $op.me; theirs = $op.them }
     files = $files
     skipped = $skipped
   }
@@ -163,14 +251,23 @@ function Serve-Static($res, [string]$urlPath) {
   Send-Bytes $res ([IO.File]::ReadAllBytes($full)) $type
 }
 
+function Assert-Token($data) {
+  if (-not $data -or [string]$data.token -ne $script:Token) {
+    throw '다른 실행에서 열린 화면이에요. 이 탭을 닫고 터미널에 표시된 주소를 새로 여세요.'
+  }
+}
+
 function Resolve-File($body) {
   $data = $body | ConvertFrom-Json
+  Assert-Token $data
   $path = [string]$data.path
   $file = $script:Session.files | Where-Object { $_.path -eq $path } | Select-Object -First 1
   if (-not $file) { throw "세션에 없는 파일: $path" }
+  # The file must still be unmerged; otherwise someone resolved it another way meanwhile.
+  $still = Invoke-Git -GitArgs @('ls-files', '-u', '--', $path)
+  if (-not $file.resolved -and -not $still) { throw "$path 는 이미 다른 방법으로 해결됐어요. 덮어쓰지 않았어요." }
   $target = [IO.Path]::GetFullPath((Join-Path $script:RepoRoot $path))
-  $enc = if ($file.bom) { New-Object Text.UTF8Encoding $true } else { $Utf8NoBom }
-  [IO.File]::WriteAllText($target, [string]$data.content, $enc)
+  [IO.File]::WriteAllText($target, [string]$data.content, (Get-Encoding $file.encoding))
   Invoke-Git -GitArgs @('add', '--', $path) | Out-Null
   $file.resolved = $true
   Write-Info "저장 + git add: $path"
@@ -197,9 +294,12 @@ if ($ServeOnly) {
   $script:RepoRoot = $ToolRoot
   $script:Session = @{ mode = 'none'; files = @(); skipped = @() }
 } else {
-  $script:RepoRoot = (& git -C $Repo rev-parse --show-toplevel 2>$null)
-  if (-not $script:RepoRoot) { Write-Info "Git 저장소가 아니에요: $Repo"; exit 1 }
-  $script:RepoRoot = [IO.Path]::GetFullPath($script:RepoRoot.Trim())
+  # Invoke-Git (not `& git ... 2>$null`): in PS 5.1 with ErrorActionPreference=Stop,
+  # redirected native stderr throws before we can print a friendly message.
+  $script:RepoRoot = [IO.Path]::GetFullPath($Repo)
+  $top = if (Test-Path -LiteralPath $script:RepoRoot -PathType Container) { Invoke-Git -GitArgs @('rev-parse', '--show-toplevel') -AllowFail } else { $null }
+  if (-not $top) { Write-Info "Git 저장소가 아니에요: $Repo"; exit 1 }
+  $script:RepoRoot = [IO.Path]::GetFullPath($top.Trim())
   $script:Session = New-Session
   if ($script:Session.files.Count -eq 0) {
     Write-Info '병합할 DataTable 충돌이 없어요.'
@@ -210,17 +310,24 @@ if ($ServeOnly) {
   foreach ($s in $script:Session.skipped) { Write-Info "  건너뜀: $($s.path) ($($s.reason))" }
 }
 
-$listener = New-Object Net.HttpListener
-$prefix = "http://localhost:$Port/"
-$listener.Prefixes.Add($prefix)
-try { $listener.Start() } catch { Write-Info "포트 $Port 를 열 수 없어요. -Port 로 다른 번호를 지정해 보세요."; exit 1 }
+# Try the requested port and the next 9, so two repos can be open at once.
+$listener = $null; $prefix = $null
+for ($p = $Port; $p -lt $Port + 10; $p++) {
+  $l = New-Object Net.HttpListener
+  $l.Prefixes.Add("http://localhost:$p/")
+  try { $l.Start(); $listener = $l; $prefix = "http://localhost:$p/"; break } catch { $l.Close() }
+}
+if (-not $listener) { Write-Info "포트 $Port~$($Port + 9) 를 열 수 없어요. -Port 로 다른 번호를 지정해 보세요."; exit 1 }
 Write-Info "병합 화면: $prefix  (끝내려면 화면의 '완료' 또는 Ctrl+C)"
 if (-not $NoBrowser) { Start-Process $prefix | Out-Null }
 
 $running = $true
 try {
   while ($running -and $listener.IsListening) {
-    $ctx = $listener.GetContext()
+    # Poll instead of blocking in GetContext() so Ctrl+C is handled right away.
+    $async = $listener.BeginGetContext($null, $null)
+    while (-not $async.AsyncWaitHandle.WaitOne(300)) { }
+    $ctx = $listener.EndGetContext($async)
     $req = $ctx.Request; $res = $ctx.Response
     try {
       $path = $req.Url.AbsolutePath
@@ -237,6 +344,7 @@ try {
         Resolve-File (Read-Body $req)
         Send-Json $res @{ ok = $true }
       } elseif ($path -eq '/api/quit' -and $req.HttpMethod -eq 'POST') {
+        if (-not $ServeOnly) { Assert-Token ((Read-Body $req) | ConvertFrom-Json) }
         Send-Json $res @{ ok = $true }
         $running = $false
       } elseif ($req.HttpMethod -eq 'GET') {
@@ -256,7 +364,8 @@ try {
 if (-not $ServeOnly) {
   $left = @($script:Session.files | Where-Object { -not $_.resolved })
   if ($left.Count -eq 0) {
-    Write-Info '모든 DataTable 충돌을 해결했어요. 남은 충돌이 없으면 git commit 으로 머지를 마치세요.'
+    $next = switch ($script:Session.op) { 'rebase' { 'git rebase --continue' } 'cherry-pick' { 'git cherry-pick --continue' } 'revert' { 'git revert --continue' } default { 'git commit' } }
+    Write-Info "모든 DataTable 충돌을 해결했어요. 남은 충돌이 없으면 $next 로 마무리하세요."
   } else {
     Write-Info "아직 해결 안 된 파일: $(($left | ForEach-Object { $_.path }) -join ', ')"
   }

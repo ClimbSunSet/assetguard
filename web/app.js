@@ -45,12 +45,26 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
-  function show(v) {
+  // quoteStrings: show "10" with quotes so it can be told apart from the number 10.
+  function show(v, quoteStrings) {
     if (v === undefined) return '<span class="muted">(없음)</span>';
-    if (v === null) return 'null';
-    if (typeof v === 'object') return esc(JSON.stringify(v));
     if (v === '') return '<span class="muted">""</span>';
-    return esc(v);
+    if (typeof v === 'string') return esc(quoteStrings ? JSON.stringify(v) : v);
+    return esc(F.toJsonText(v));
+  }
+  function kind(v) {
+    if (v === undefined) return null;
+    if (v instanceof M.Num || typeof v === 'number') return 'number';
+    if (v === null) return 'null';
+    return Array.isArray(v) ? 'array' : typeof v;
+  }
+  function mixedTypes(values) {
+    var kinds = values.map(kind).filter(function (k) { return k !== null; });
+    return kinds.some(function (k) { return k !== kinds[0]; });
+  }
+  function rawText(v) {
+    if (v === undefined || v === null) return '';
+    return typeof v === 'string' ? v : F.toJsonText(v);
   }
   function commitText(c) {
     if (!c) return '';
@@ -71,15 +85,20 @@
   }
 
   function prepare(f) {
-    var entry = { raw: f, error: null, result: null, choices: {}, saved: false, style: null };
+    var entry = { raw: f, error: null, result: null, choices: {}, drafts: {}, saved: false, style: null };
     try {
-      var base = F.parse(f.path, f.base), ours = F.parse(f.path, f.ours), theirs = F.parse(f.path, f.theirs);
-      entry.style = (ours || theirs || base).style;
+      if (f.ours == null || f.theirs == null) throw new Error('한쪽 버전이 없어요. 파일을 남길지 지울지 먼저 정하세요.');
+      var base = parseSide(f.path, f.base, '공통 원본'), ours = parseSide(f.path, f.ours, '내'), theirs = parseSide(f.path, f.theirs, '상대');
+      entry.style = ours.style;
       entry.result = M.merge3(base, ours, theirs);
     } catch (e) {
       entry.error = e.message;
     }
     return entry;
+  }
+  function parseSide(path, text, label) {
+    try { return F.parse(path, text); }
+    catch (e) { throw new Error(label + ' 버전을 읽지 못했어요: ' + e.message); }
   }
 
   function unresolved(entry) {
@@ -96,6 +115,10 @@
       '<span class="side src-theirs">상대 <b>' + esc(L.theirs) + '</b></span>';
     if (state.demo) {
       banner('지금은 <b>데모 데이터</b>예요. 실제 충돌은 머지 충돌 난 저장소에서 <code>assetguard.ps1</code>을 실행하면 열려요.', 'info');
+    } else if (s.op === 'rebase') {
+      banner('<b>rebase 중</b>이에요. "나"는 다시 적용 중인 내 커밋, "상대"는 그 아래 깔리는 ' + esc(L.theirs) + '예요.', 'info');
+    } else if (s.op && s.op !== 'merge') {
+      banner('<b>' + esc(s.op) + '</b> 중 충돌이에요. "나"는 현재 브랜치, "상대"는 ' + esc(L.theirs) + '예요.', 'info');
     }
     $('skipped').innerHTML = (s.skipped && s.skipped.length)
       ? '<h2>건너뛴 파일</h2>' + s.skipped.map(function (k) {
@@ -158,7 +181,11 @@
         '<span class="chip src-ours">나</span> ' + esc(commitText(c.ours) || L.ours) + '<br>' +
         '<span class="chip src-theirs">상대</span> ' + esc(commitText(c.theirs) || L.theirs) +
         (c.base ? '<br><span class="chip src-base">원본</span> ' + esc(commitText(c.base)) : '') +
-      '</span></div>';
+      '</span></div>' +
+      (e.result.warnings.length
+        ? '<div class="stat warnbox" style="grid-column: 1 / -1"><span class="l">' +
+            e.result.warnings.map(function (w) { return '⚠ ' + esc(w); }).join('<br>') + '</span></div>'
+        : '');
   }
   function stat(n, label, kind) {
     return '<div class="stat ' + (kind || '') + '"><span class="n">' + n + '</span><span class="l">' + esc(label) + '</span></div>';
@@ -228,16 +255,19 @@
             opt(cf.id, 'theirs', '상대 쪽', oursDeleted ? rowPreview(cf.theirs) : '행 삭제', commitText(c.theirs), pick === 'theirs') +
           '</div></div>';
       }
+      var q = mixedTypes([cf.base, cf.ours, cf.theirs]);
+      var draft = has(e.drafts, cf.id) ? e.drafts[cf.id] : (isCustom ? rawText(pick.custom) : '');
       return '<div class="card' + (pick ? ' done' : '') + '" id="card-' + cf.id + '">' +
         '<div class="where" data-goto="' + cf.id + '">' + esc(cf.row) + ' · ' + esc(cf.column) + '</div>' +
-        '<div class="why">양쪽이 같은 칸을 서로 다르게 바꿨어요.</div>' +
+        '<div class="why">양쪽이 같은 칸을 서로 다르게 바꿨어요.' + (q ? ' <b>값의 형식(숫자/문자열)도 서로 달라요.</b>' : '') + '</div>' +
         '<div class="opts">' +
-          opt(cf.id, 'ours', '내 값', show(cf.ours), commitText(c.ours), pick === 'ours', true) +
-          opt(cf.id, 'theirs', '상대 값', show(cf.theirs), commitText(c.theirs), pick === 'theirs', true) +
-          opt(cf.id, 'base', '원본', show(cf.base), '', pick === 'base', true) +
+          opt(cf.id, 'ours', '내 값', show(cf.ours, q), commitText(c.ours), pick === 'ours', true) +
+          opt(cf.id, 'theirs', '상대 값', show(cf.theirs, q), commitText(c.theirs), pick === 'theirs', true) +
+          opt(cf.id, 'base', '원본', show(cf.base, q), '', pick === 'base', true) +
         '</div>' +
-        '<div class="custom"><input data-custom-input="' + cf.id + '" placeholder="직접 입력" value="' + (isCustom ? esc(typeof pick.custom === 'string' ? pick.custom : JSON.stringify(pick.custom)) : '') + '">' +
+        '<div class="custom"><input data-custom-input="' + cf.id + '" placeholder="직접 입력 (' + esc(typeHint(cf)) + ')" value="' + esc(draft) + '">' +
         '<button class="btn small" data-custom="' + cf.id + '">적용</button></div>' +
+        '<div class="err" id="err-' + cf.id + '" hidden></div>' +
         '</div>';
     }).join('');
   }
@@ -245,9 +275,10 @@
   function rowPreview(cells) {
     if (!cells) return '행 삭제';
     return esc(Object.keys(cells).filter(function (k) { return cells[k] !== undefined; }).map(function (k) {
-      var v = cells[k]; return k + '=' + (typeof v === 'object' ? JSON.stringify(v) : v);
+      return k + '=' + rawText(cells[k]);
     }).join(', '));
   }
+  function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
   function opt(id, side, label, valHtml, meta, selected, isHtml) {
     return '<button class="opt ' + side + (selected ? ' selected' : '') + '" data-pick="' + id + '" data-side="' + side + '">' +
@@ -255,13 +286,34 @@
       (meta ? '<span class="meta">' + esc(meta) + '</span>' : '') + '</button>';
   }
 
-  // Custom input: keep the type of the existing values (number stays number).
+  // Custom input must match the column's type; invalid input is rejected, never coerced.
+  function sampleKind(cf) {
+    var k = kind(cf.ours); if (k === null || k === 'null') k = kind(cf.theirs);
+    if (k === null || k === 'null') k = kind(cf.base);
+    return k || 'string';
+  }
+  function typeHint(cf) {
+    return { number: '숫자', boolean: 'true / false', object: 'JSON 객체', array: 'JSON 배열' }[sampleKind(cf)] || '문자열';
+  }
+  var NUM_TEXT = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
   function parseCustom(text, cf) {
-    var sample = cf.ours !== undefined ? cf.ours : cf.theirs;
-    if (typeof sample === 'number' && text.trim() !== '' && !isNaN(Number(text))) return Number(text);
-    if (typeof sample === 'boolean' && /^(true|false)$/i.test(text.trim())) return text.trim().toLowerCase() === 'true';
-    if (sample && typeof sample === 'object') { try { return JSON.parse(text); } catch (e) { /* keep string */ } }
-    return text;
+    var k = sampleKind(cf), t = text.trim();
+    if (k === 'number') {
+      if (!NUM_TEXT.test(t)) return { error: '숫자만 넣을 수 있어요 (예: 12, -3.5).' };
+      return { value: new M.Num(t) };
+    }
+    if (k === 'boolean') {
+      if (!/^(true|false)$/i.test(t)) return { error: 'true 또는 false만 넣을 수 있어요.' };
+      return { value: t.toLowerCase() === 'true' };
+    }
+    if (k === 'object' || k === 'array') {
+      try {
+        var v = F.parseJsonValue(t);
+        if (kind(v) !== k) return { error: (k === 'array' ? 'JSON 배열' : 'JSON 객체') + ' 형식이어야 해요.' };
+        return { value: v };
+      } catch (e) { return { error: 'JSON 형식이 올바르지 않아요.' }; }
+    }
+    return { value: text }; // strings: any text, including empty, is a legitimate value
   }
 
   function choose(id, value) {
@@ -320,7 +372,7 @@
         custom: choices.filter(function (c) { return typeof c === 'object'; }).length
       }
     };
-    fetch('/api/resolve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: e.raw.path, content: content, metrics: metrics }) })
+    fetch('/api/resolve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: state.session.token, path: e.raw.path, content: content, metrics: metrics }) })
       .then(function (r) { return r.json(); })
       .then(function (res) {
         if (!res.ok) throw new Error(res.error || '저장 실패');
@@ -328,7 +380,7 @@
         renderFileList(); updateSave();
         var remaining = state.files.filter(function (f) { return !f.saved; }).length;
         banner(remaining ? esc(e.raw.path) + ' 저장 완료. 남은 파일 ' + remaining + '개.'
-          : '모든 파일 저장 완료. <b>완료</b>를 누르고 터미널에서 <code>git commit</code> 하면 머지가 끝나요.');
+          : '모든 파일 저장 완료. <b>완료</b>를 누르고 터미널에서 <code>' + nextCommand() + '</code> 하면 끝나요.');
         var nextIdx = state.files.findIndex(function (f) { return !f.saved && !f.error; });
         if (nextIdx >= 0 && nextIdx !== state.current) select(nextIdx);
       })
@@ -344,7 +396,13 @@
     if (t.dataset.custom) {
       var id = t.dataset.custom, input = document.querySelector('[data-custom-input="' + id + '"]');
       var cf = cur().result.conflicts.filter(function (c) { return c.id === id; })[0];
-      return choose(id, { custom: parseCustom(input.value, cf) });
+      var parsed = parseCustom(input.value, cf);
+      if (parsed.error) {
+        var errEl = $('err-' + id); errEl.textContent = parsed.error; errEl.hidden = false; input.focus();
+        return;
+      }
+      delete cur().drafts[id];
+      return choose(id, { custom: parsed.value });
     }
     if (t.dataset.goto) return focusCard(t.dataset.goto, true);
     if (t.dataset.conflict) return focusCard(t.dataset.conflict, false);
@@ -355,6 +413,10 @@
       renderSummary(); renderGrid(); renderConflicts(); renderFileList(); updateSave();
     }
   });
+  // Keep unapplied text in custom inputs when other cards re-render.
+  document.addEventListener('input', function (ev) {
+    if (ev.target.matches('[data-custom-input]')) cur().drafts[ev.target.dataset.customInput] = ev.target.value;
+  });
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter' && ev.target.matches('[data-custom-input]')) {
       document.querySelector('[data-custom="' + ev.target.dataset.customInput + '"]').click();
@@ -364,10 +426,18 @@
   $('save').addEventListener('click', save);
   $('quit').addEventListener('click', function () {
     if (state.demo) { banner('데모 모드에서는 닫을 서버가 없어요.', 'info'); return; }
-    fetch('/api/quit', { method: 'POST' }).finally(function () {
-      document.body.innerHTML = '<div style="padding:40px;font-size:15px">병합 화면을 닫았어요. 터미널로 돌아가서 <code>git status</code>로 확인하고 <code>git commit</code> 하세요.</div>';
-    });
+    fetch('/api/quit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: state.session.token }) })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (!res.ok) throw new Error(res.error || '종료 실패');
+        document.body.innerHTML = '<div style="padding:40px;font-size:15px">병합 화면을 닫았어요. 터미널로 돌아가서 <code>git status</code>로 확인하고 <code>' + nextCommand() + '</code> 하세요.</div>';
+      })
+      .catch(function (err) { banner(esc(err.message), 'info'); });
   });
+  function nextCommand() {
+    var op = state.session && state.session.op;
+    return op === 'rebase' ? 'git rebase --continue' : op === 'cherry-pick' ? 'git cherry-pick --continue' : op === 'revert' ? 'git revert --continue' : 'git commit';
+  }
 
   load();
 })();

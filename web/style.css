@@ -130,6 +130,9 @@ td.flash { animation: flash 1s ease; }
 .custom { display: flex; gap: 6px; margin-top: 6px; }
 .custom input { flex: 1; min-width: 0; font: 12px Consolas, monospace; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
 .empty { color: var(--muted); font-size: 13px; padding: 12px 4px; }
+.err { color: var(--theirs); font-size: 12px; margin-top: 4px; }
+.stat.warnbox { border-color: var(--conflict); background: var(--conflict-bg); }
+.stat.warnbox .l { color: var(--text); }
 
 .saveBar { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
 .btn {
