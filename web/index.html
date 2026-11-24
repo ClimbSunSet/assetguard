@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AssetGuard 병합</title>
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◆</span>
+    <strong>AssetGuard</strong>
+    <span class="muted" id="repo"></span>
+  </div>
+  <div class="sides" id="sides"></div>
+  <button class="btn ghost" id="quit" title="병합 화면을 닫고 터미널로 돌아갑니다">완료</button>
+</header>
+
+<div class="layout">
+  <aside class="files">
+    <h2>충돌 파일</h2>
+    <ul id="fileList"></ul>
+    <div id="skipped"></div>
+  </aside>
+
+  <main class="main">
+    <div id="banner" class="banner" hidden></div>
+    <section class="summary" id="summary"></section>
+    <div class="toolbar">
+      <label class="toggle"><input type="checkbox" id="onlyChanged" checked> 바뀐 행만 보기</label>
+      <div class="legend">
+        <span class="chip src-ours">나</span>
+        <span class="chip src-theirs">상대</span>
+        <span class="chip src-both">양쪽 동일</span>
+        <span class="chip src-base">원본 그대로</span>
+        <span class="chip src-conflict">직접 선택</span>
+      </div>
+    </div>
+    <div class="tableWrap"><table id="grid"></table></div>
+  </main>
+
+  <aside class="conflicts">
+    <div class="conflictsHead">
+      <h2>확인할 곳 <span id="leftCount" class="count"></span></h2>
+      <div class="bulk">
+        <button class="btn small" data-bulk="ours">남은 것 모두 내 값</button>
+        <button class="btn small" data-bulk="theirs">남은 것 모두 상대 값</button>
+      </div>
+    </div>
+    <div id="conflictList"></div>
+    <div class="saveBar">
+      <button class="btn primary" id="save" disabled>저장하고 git add</button>
+      <p class="muted small" id="saveHint"></p>
+    </div>
+  </aside>
+</div>
+
+<script src="/web/merge.js"></script>
+<script src="/web/formats.js"></script>
+<script src="/web/app.js"></script>
+</body>
+</html>

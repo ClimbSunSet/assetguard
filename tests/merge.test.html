@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>AssetGuard 테스트</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; background: #fff; color: #111; }
+  .pass { color: #0a7d32; } .fail { color: #c62828; font-weight: 600; }
+  pre { background: #f4f4f4; padding: 8px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>AssetGuard 병합 엔진 테스트</h1>
+<p id="summary">실행 중…</p>
+<ul id="out"></ul>
+<script src="../web/merge.js"></script>
+<script src="../web/formats.js"></script>
+<script>
+(function () {
+  var M = window.AssetGuardMerge, F = window.AssetGuardFormats;
+  var results = [];
+  function test(name, fn) {
+    try { fn(); results.push({ name: name, ok: true }); }
+    catch (e) { results.push({ name: name, ok: false, err: e && e.stack || String(e) }); }
+  }
+  function eq(a, b, msg) {
+    if (!M.same(a, b)) throw new Error((msg || '값이 다름') + '\n  기대: ' + JSON.stringify(b) + '\n  실제: ' + JSON.stringify(a));
+  }
+  function T(rows) { // rows: { Name: {col: v} }
+    var cols = [];
+    var list = Object.keys(rows).map(function (n) {
+      Object.keys(rows[n]).forEach(function (c) { if (cols.indexOf(c) < 0) cols.push(c); });
+      return { name: n, cells: rows[n] };
+    });
+    return { columns: cols, rows: list };
+  }
+  function cell(res, row, col) {
+    var r = res.rows.filter(function (x) { return x.name === row; })[0];
+    return r && r.cells[col];
+  }
+  function names(table) { return table.rows.map(function (r) { return r.name; }); }
+
+  // ----- 사업계획서 표의 4가지 규칙 -----
+  test('내가 바꾼 칸은 내 값 자동 채택', function () {
+    var r = M.merge3(T({ A: { HP: 10 } }), T({ A: { HP: 12 } }), T({ A: { HP: 10 } }));
+    eq(cell(r, 'A', 'HP'), { value: 12, source: 'ours' }); eq(r.conflicts.length, 0);
+  });
+  test('상대가 바꾼 칸은 상대 값 자동 채택', function () {
+    var r = M.merge3(T({ A: { HP: 10 } }), T({ A: { HP: 10 } }), T({ A: { HP: 15 } }));
+    eq(cell(r, 'A', 'HP'), { value: 15, source: 'theirs' }); eq(r.conflicts.length, 0);
+  });
+  test('상대가 추가한 행은 자동 채택', function () {
+    var r = M.merge3(T({ A: { HP: 10 } }), T({ A: { HP: 10 } }), T({ A: { HP: 10 }, B: { HP: 5 } }));
+    var row = r.rows.filter(function (x) { return x.name === 'B'; })[0];
+    eq(row.status, 'added-theirs'); eq(cell(r, 'B', 'HP'), { value: 5, source: 'theirs' });
+  });
+  test('양쪽이 같은 칸을 다르게 바꾸면 진짜 충돌', function () {
+    var r = M.merge3(T({ A: { HP: 10 } }), T({ A: { HP: 12 } }), T({ A: { HP: 15 } }));
+    eq(r.conflicts.length, 1); eq(r.conflicts[0].kind, 'cell');
+    eq([r.conflicts[0].base, r.conflicts[0].ours, r.conflicts[0].theirs], [10, 12, 15]);
+    eq(cell(r, 'A', 'HP').source, 'conflict');
+  });
+
+  // ----- 추가 규칙 -----
+  test('같은 행의 다른 칸을 각자 바꾸면 둘 다 반영', function () {
+    var r = M.merge3(T({ A: { HP: 10, Speed: 1 } }), T({ A: { HP: 12, Speed: 1 } }), T({ A: { HP: 10, Speed: 3 } }));
+    eq(r.conflicts.length, 0);
+    var out = M.applyResolutions(r, {});
+    eq(out.rows[0].cells, { HP: 12, Speed: 3 });
+  });
+  test('양쪽이 같은 값으로 바꾸면 충돌 아님 (source=both)', function () {
+    var r = M.merge3(T({ A: { HP: 10 } }), T({ A: { HP: 20 } }), T({ A: { HP: 20 } }));
+    eq(cell(r, 'A', 'HP'), { value: 20, source: 'both' });
+  });
+  test('양쪽이 서로 다른 행을 추가하면 둘 다 들어감 (실제 사례 대부분)', function () {
+    var base = T({ A: { HP: 1 } });
+    var r = M.merge3(base, T({ A: { HP: 1 }, Mine: { HP: 2 } }), T({ A: { HP: 1 }, Theirs: { HP: 3 } }));
+    eq(r.conflicts.length, 0);
+    eq(names(M.applyResolutions(r, {})), ['A', 'Mine', 'Theirs']);
+  });
+  test('상대 추가 행은 상대 파일에서의 위치 근처에 들어감', function () {
+    var r = M.merge3(T({ A: {x:1}, C: {x:1} }), T({ A: {x:1}, C: {x:1} }), T({ A: {x:1}, B: {x:2}, C: {x:1} }));
+    eq(names(M.applyResolutions(r, {})), ['A', 'B', 'C']);
+  });
+  test('같은 이름 행을 양쪽이 다르게 추가하면 칸 충돌', function () {
+    var r = M.merge3(T({}), T({ N: { HP: 1, S: 9 } }), T({ N: { HP: 2, S: 9 } }));
+    eq(r.conflicts.length, 1); eq(r.conflicts[0].column, 'HP'); eq(r.conflicts[0].base, undefined);
+  });
+  test('한쪽이 지우고 상대는 안 건드렸으면 삭제', function () {
+    var base = T({ A: { HP: 1 }, B: { HP: 2 } });
+    var r = M.merge3(base, T({ A: { HP: 1 } }), base);
+    eq(r.conflicts.length, 0); eq(names(M.applyResolutions(r, {})), ['A']);
+    eq(r.rows.filter(function (x) { return x.name === 'B'; })[0].deletedBy, 'ours');
+  });
+  test('한쪽이 지우고 상대가 고쳤으면 행 충돌', function () {
+    var r = M.merge3(T({ A: { HP: 1 }, B: { HP: 2 } }), T({ A: { HP: 1 } }), T({ A: { HP: 1 }, B: { HP: 5 } }));
+    eq(r.conflicts.length, 1); eq(r.conflicts[0].kind, 'row');
+    eq(names(M.applyResolutions(r, { c0: 'ours' })), ['A']);
+    var kept = M.applyResolutions(r, { c0: 'theirs' });
+    eq(kept.rows[1], { name: 'B', cells: { HP: 5 } });
+  });
+  test('구조체·배열 값도 내용으로 비교 (키 순서 무관)', function () {
+    var r = M.merge3(T({ A: { V: { X: 1, Y: 2 } } }), T({ A: { V: { Y: 2, X: 1 } } }), T({ A: { V: { X: 1, Y: 3 } } }));
+    eq(r.conflicts.length, 0); eq(cell(r, 'A', 'V'), { value: { X: 1, Y: 3 }, source: 'theirs' });
+  });
+  test('상대가 새 열을 추가하면 열과 값이 들어감', function () {
+    var r = M.merge3(T({ A: { HP: 1 } }), T({ A: { HP: 2 } }), T({ A: { HP: 1, Armor: 7 } }));
+    var out = M.applyResolutions(r, {});
+    eq(out.columns, ['HP', 'Armor']); eq(out.rows[0].cells, { HP: 2, Armor: 7 });
+  });
+  test('미해결 충돌이 있으면 저장 거부', function () {
+    var r = M.merge3(T({ A: { HP: 10 } }), T({ A: { HP: 12 } }), T({ A: { HP: 15 } }));
+    var threw = false; try { M.applyResolutions(r, {}); } catch (e) { threw = true; }
+    eq(threw, true);
+  });
+  test('직접 입력 값으로 충돌 해결', function () {
+    var r = M.merge3(T({ A: { HP: 10 } }), T({ A: { HP: 12 } }), T({ A: { HP: 15 } }));
+    eq(M.applyResolutions(r, { c0: { custom: 14 } }).rows[0].cells.HP, 14);
+  });
+  test('같은 입력이면 항상 같은 결과 (결정적)', function () {
+    var b = T({ A: { HP: 1 }, B: { HP: 2 } }), o = T({ A: { HP: 3 }, C: { HP: 4 } }), t = T({ B: { HP: 2 }, A: { HP: 1 }, D: { HP: 5 } });
+    eq(JSON.stringify(M.merge3(b, o, t)), JSON.stringify(M.merge3(b, o, t)));
+  });
+
+  // ----- 포맷 -----
+  test('UE JSON 왕복 (탭 들여쓰기, CRLF 유지)', function () {
+    var src = '[\r\n\t{\r\n\t\t"Name": "Row_1",\r\n\t\t"HP": 10\r\n\t}\r\n]\r\n';
+    var t = F.parse('x.json', src);
+    eq(t.columns, ['HP']); eq(F.write(t, t.style), src);
+  });
+  test('UE CSV 왕복 (값 따옴표 유지)', function () {
+    var src = '---,HP,Desc\r\nRow_1,"10","He said ""hi"", ok"\r\nRow_2,"5",""\r\n';
+    var t = F.parse('x.csv', src);
+    eq(t.rows[0].cells.Desc, 'He said "hi", ok');
+    eq(F.write(t, t.style), src);
+  });
+  test('파일이 한쪽에 없으면 null', function () { eq(F.parse('x.json', null), null); });
+  test('파일이 새로 생긴 경우(공통 원본 없음)도 병합', function () {
+    var r = M.merge3(null, T({ A: { HP: 1 } }), T({ B: { HP: 2 } }));
+    eq(names(M.applyResolutions(r, {})), ['A', 'B']);
+  });
+
+  var failed = results.filter(function (r) { return !r.ok; });
+  document.getElementById('summary').innerHTML = failed.length
+    ? '<span class="fail">' + failed.length + '개 실패</span> / ' + results.length + '개'
+    : '<span class="pass">모두 통과</span> (' + results.length + '개)';
+  document.getElementById('out').innerHTML = results.map(function (r) {
+    return '<li class="' + (r.ok ? 'pass' : 'fail') + '">' + (r.ok ? '✔ ' : '✘ ') + r.name +
+      (r.ok ? '' : '<pre>' + r.err.replace(/</g, '&lt;') + '</pre>') + '</li>';
+  }).join('');
+  window.__testResults = { total: results.length, failed: failed.map(function (f) { return f.name + ': ' + f.err; }) };
+})();
+</script>
+</body>
+</html>
